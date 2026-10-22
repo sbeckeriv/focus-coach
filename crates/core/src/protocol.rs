@@ -18,13 +18,27 @@ pub enum Request {
     Pause,
     Resume,
     Next,
+    /// Fetch a link and file it, through the coach.
     Add { url: String },
+    /// Add a task straight to the list, with no model call. `due` takes YYYY-MM-DD,
+    /// "today", "tomorrow" or a weekday name.
+    New { title: String, section: Option<String>, due: Option<String> },
+    /// Approve a proposed outgoing action; the coach then carries it out.
+    Approve { id: String },
+    Reject { id: String },
+    /// Run a check-in now, with the progress check first if one is set.
+    CheckIn,
     /// Check a task off, or reopen it if it's done. No model call.
     Toggle { id: String },
     /// A coach tool call from `focus mcp`, run inside the active claude-code turn.
     Tool { turn: u64, name: String, input: serde_json::Value },
     Report,
-    Subscribe,
+    /// Stream every event. `notifies`: this client shows check-in notifications itself,
+    /// so the daemon doesn't send its own.
+    Subscribe {
+        #[serde(default)]
+        notifies: bool,
+    },
     Shutdown,
 }
 
@@ -41,6 +55,20 @@ pub struct Status {
     /// The Claude Code session the coach is in, for provider = "claude-code".
     #[serde(default)]
     pub session: Option<String>,
+    /// Outgoing actions waiting for the person's approval.
+    #[serde(default)]
+    pub pending: Vec<Proposal>,
+}
+
+/// An outgoing action the coach wants to take: a message, a comment, a draft.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Proposal {
+    pub id: String,
+    /// e.g. "slack message", "pr comment", "email draft".
+    pub kind: String,
+    /// Where it goes: a channel, a PR URL, a person.
+    pub target: String,
+    pub content: String,
 }
 
 impl Status {
@@ -54,7 +82,11 @@ impl Status {
             }
         };
         let top = self.top.as_deref().unwrap_or("nothing open");
-        format!("{} open · top: {top} · {timer}", self.open)
+        let mut out = format!("{} open · top: {top} · {timer}", self.open);
+        if !self.pending.is_empty() {
+            out.push_str(&format!(" · {} awaiting approval", self.pending.len()));
+        }
+        out
     }
 }
 
@@ -62,9 +94,13 @@ impl Status {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
     CheckIn { text: String },
+    /// A note to self the coach sent; front ends that notify show it like a check-in.
+    Note { text: String },
     Reply { turn: u64, text: String },
     Question { turn: u64, text: String },
     Preview { turn: u64, kind: String, content: String },
+    /// The coach proposed an outgoing action and is waiting for approval.
+    Proposal { turn: u64, proposal: Proposal },
     Changed { turn: u64, summary: String },
     Report { turn: u64, text: String, path: String },
     Error { turn: u64, text: String },
@@ -85,6 +121,7 @@ impl Event {
             Event::Reply { turn, .. }
             | Event::Question { turn, .. }
             | Event::Preview { turn, .. }
+            | Event::Proposal { turn, .. }
             | Event::Changed { turn, .. }
             | Event::Report { turn, .. }
             | Event::Error { turn, .. }

@@ -383,11 +383,11 @@ pub struct ClaudeCode {
     command: Option<String>,
     light: (String, String),
     strong: (String, String),
+    /// Tools Claude Code may use without asking (`claude_code_tools`).
+    tools: Vec<String>,
+    /// Load the person's own MCP servers next to `focus mcp`.
+    user_mcp: bool,
 }
-
-/// Claude Code's built-ins the coach may use without asking, next to `mcp__focus`.
-const CLAUDE_CODE_TOOLS: &[&str] =
-    &["Bash", "Read", "Edit", "Write", "Glob", "Grep", "WebFetch", "WebSearch", "mcp__focus"];
 
 impl ClaudeCode {
     fn new(llm: &LlmSettings) -> Self {
@@ -395,6 +395,8 @@ impl ClaudeCode {
             command: llm.command.clone(),
             light: (llm.light_model.clone(), llm.light_effort.clone()),
             strong: (llm.strong_model.clone(), llm.strong_effort.clone()),
+            tools: llm.claude_code_tools.clone(),
+            user_mcp: llm.claude_code_user_mcp,
         }
     }
 
@@ -462,16 +464,22 @@ impl ClaudeCode {
             Some((id, false)) => cmd.args(["--session-id", id]),
             None => cmd.arg("--no-session-persistence"),
         };
-        cmd.args(["--system-prompt", system, "--strict-mcp-config"]);
+        cmd.args(["--system-prompt", system]);
         if !effort.is_empty() {
             cmd.args(["--effort", effort]);
         }
         match mcp {
             Some(config) => {
-                cmd.args(["--mcp-config", config, "--allowedTools"]).args(CLAUDE_CODE_TOOLS);
+                cmd.args(["--mcp-config", config]);
+                if !self.user_mcp {
+                    cmd.arg("--strict-mcp-config");
+                }
+                if !self.tools.is_empty() {
+                    cmd.arg("--allowedTools").args(&self.tools);
+                }
             }
             None => {
-                cmd.args(["--tools", ""]);
+                cmd.args(["--tools", "", "--strict-mcp-config"]);
             }
         }
         if let Some(dir) = cwd {

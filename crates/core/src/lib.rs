@@ -1,6 +1,7 @@
 pub mod client;
 pub mod config;
 pub mod daemon;
+mod hours;
 mod interpreter;
 pub mod log;
 pub mod mcp;

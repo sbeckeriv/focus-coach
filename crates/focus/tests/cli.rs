@@ -172,7 +172,7 @@ fn claude_code_home(extra_llm: &str) -> tempfile::TempDir {
     std::fs::write(&fake, FAKE_CLAUDE).unwrap();
     std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
     let config = format!(
-        "schedule = \"0 3 1 1 *\"\nnotifier = \"terminal\"\n\n[llm]\nprovider = \"claude-code\"\ncommand = \"{}\"\nlight_model = \"haiku-test\"\nstrong_model = \"opus-test\"\n{extra_llm}",
+        "schedule = \"0 3 1 1 *\"\nnotifier = \"terminal\"\nmorning_bootstrap = \"\"\nreport_at = \"off\"\n\n[llm]\nprovider = \"claude-code\"\ncommand = \"{}\"\nlight_model = \"haiku-test\"\nstrong_model = \"opus-test\"\n{extra_llm}",
         fake.display()
     );
     std::fs::write(dir.path().join("focus.toml"), config).unwrap();
@@ -207,7 +207,7 @@ async fn claude_code_provider_runs_turns_through_claude_and_focus_mcp() {
     let args = &calls[0];
     assert!(args.contains(&"-p".into()) && flag(args, "--output-format") == Some("json"), "{args:?}");
     assert_eq!(flag(args, "--model"), Some("haiku-test"));
-    assert!(args.contains(&"--strict-mcp-config".into()), "{args:?}");
+    assert!(!args.contains(&"--strict-mcp-config".into()), "your own MCP servers load by default: {args:?}");
     assert!(flag(args, "--allowedTools") == Some("Bash") && args.contains(&"mcp__focus".into()), "all built-ins plus the coach's: {args:?}");
     assert!(args.iter().any(|a| a.starts_with("You are Focus Coach") && a.contains("mcp__focus__")), "{args:?}");
     let prompt = read("claude-stdin");
@@ -285,4 +285,35 @@ async fn a_configured_session_id_is_resumed_even_when_we_didnt_create_it() {
     assert_eq!(claude_calls(home).len(), 3, "and resumes directly from then on");
     assert_eq!(flag(&claude_calls(home)[2], "--resume"), Some(id));
     let _ = run(home, &["stop"]).await;
+}
+
+#[tokio::test]
+async fn claude_code_tools_and_mcp_loading_come_from_config() {
+    let dir = claude_code_home("claude_code_tools = [\"Read\", \"mcp__focus\", \"mcp__slack\"]\nclaude_code_user_mcp = false\n");
+    let home = dir.path();
+    assert!(run(home, &["say", "anything from slack?"]).await.0);
+    let args = &claude_calls(home)[0];
+    assert!(args.contains(&"--strict-mcp-config".into()), "only the coach's server: {args:?}");
+    let allowed: Vec<&str> = args.iter().skip_while(|a| *a != "--allowedTools").skip(1).map(String::as_str).collect();
+    assert_eq!(allowed, ["Read", "mcp__focus", "mcp__slack"]);
+    let _ = run(home, &["stop"]).await;
+}
+
+#[tokio::test]
+async fn add_takes_a_title_or_a_link() {
+    let llm = MockLlm::start().await;
+    let home = Home::new(&llm, "## Today\n- [ ] Existing {id=t1}\n");
+
+    let (ok, out, err) = home.focus(&["add", "renew", "passport", "--due", "2026-11-02", "--section", "Personal"]).await;
+    assert!(ok, "{err}");
+    assert!(out.contains("· added t2 to Personal: renew passport, due Mon 11/02"), "{out}");
+    assert!(llm.requests().is_empty(), "a title is added without the model");
+
+    llm.script([text("Filed it.")]);
+    let (ok, out, _) = home.focus(&["add", "https://github.com/o/r/pull/9"]).await;
+    assert!(ok && out.contains("Filed it."), "{out}");
+    assert!(support::user_prompt(&llm.requests()[0]).contains("https://github.com/o/r/pull/9 add to the list"));
+
+    let (ok, _, err) = home.focus(&["add"]).await;
+    assert!(!ok && err.contains("add what?"), "{err}");
 }

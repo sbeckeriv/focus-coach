@@ -82,7 +82,11 @@ function renderTasks(list) {
     if (!section.on_hold) {
       for (const task of visible) {
         const row = el("div", `task ${task.state}${task.id === top ? " top" : ""}`);
-        row.appendChild(el("span", "mark", task.id === top ? "▶" : MARKS[task.state]));
+        const mark = el("button", "mark", task.id === top ? "▶" : MARKS[task.state]);
+        mark.type = "button";
+        mark.title = task.state === "done" ? "Reopen" : "Check off";
+        mark.addEventListener("click", () => run(invoke("control", { action: "toggle", arg: task.id })));
+        row.appendChild(mark);
         const name = el("span", "name", task.title);
         if (task.links?.length) name.title = task.links.join("\n");
         row.appendChild(name);
@@ -109,6 +113,25 @@ async function refreshTasks() {
 function onEvent(ev) {
   switch (ev.type) {
     case "check_in": push("checkin", ev.text); break;
+    case "note": push("coach", `Note to self: ${ev.text}`); break;
+    case "proposal": {
+      const p = ev.proposal;
+      const node = push("preview proposal", "");
+      node.appendChild(el("span", "label", `${p.id} · ${p.kind} to ${p.target} · awaiting approval`));
+      node.appendChild(document.createTextNode(p.content));
+      const buttons = el("div", "choices");
+      for (const [action, label] of [["approve", "Approve"], ["reject", "Reject"]]) {
+        const b = el("button", action, label);
+        b.type = "button";
+        b.addEventListener("click", () => {
+          buttons.remove();
+          run(invoke("control", { action, arg: p.id }));
+        });
+        buttons.appendChild(b);
+      }
+      node.appendChild(buttons);
+      break;
+    }
     case "reply": case "ok": push("coach", ev.text); break;
     case "question": push("question", ev.text); break;
     case "preview": {
@@ -142,7 +165,10 @@ async function run(promise) {
 function slash(text) {
   const [cmd, ...rest] = text.split(" ");
   const arg = rest.join(" ").trim() || null;
-  const actions = { "/next": "next", "/pause": "pause", "/resume": "resume", "/report": "report", "/add": "add", "/start": "start" };
+  const actions = {
+    "/next": "next", "/pause": "pause", "/resume": "resume", "/report": "report",
+    "/add": "add", "/start": "start", "/approve": "approve", "/reject": "reject",
+  };
   return actions[cmd] ? { action: actions[cmd], arg } : null;
 }
 

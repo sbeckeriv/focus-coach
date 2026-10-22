@@ -7,9 +7,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use focus_core::store::TaskList;
 use focus_core::{Event, Paths, Request, Status, client, daemon};
 use tauri::image::Image;
-use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, Rect, WindowEvent, Wry};
+use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
+use tauri_plugin_notification::NotificationExt;
 
 const TRAY_ID: &str = "focus";
 
@@ -42,14 +44,23 @@ async fn say(text: String, paths: tauri::State<'_, Paths>) -> Result<Vec<Event>,
     send(&paths, Request::Say { text }).await
 }
 
-/// The popover's buttons and slash commands.
+/// The popover's buttons, task clicks and slash commands.
 fn control_request(action: &str, arg: Option<String>) -> Result<Request, String> {
+    let arg = arg.map(|a| a.trim().to_string()).filter(|a| !a.is_empty());
+    let need = |what: &str| arg.clone().ok_or_else(|| format!("{action} needs {what}"));
     Ok(match action {
         "pause" => Request::Pause,
         "resume" => Request::Resume,
         "next" => Request::Next,
         "report" => Request::Report,
-        "add" => Request::Add { url: arg.filter(|a| !a.trim().is_empty()).ok_or("add needs a URL")? },
+        "add" => {
+            let text = need("a title or a URL")?;
+            let is_link = !text.contains(char::is_whitespace) && (text.starts_with("http://") || text.starts_with("https://"));
+            if is_link { Request::Add { url: text } } else { Request::New { title: text, section: None, due: None } }
+        }
+        "toggle" => Request::Toggle { id: need("a task id")? },
+        "approve" => Request::Approve { id: need("an action id")? },
+        "reject" => Request::Reject { id: need("an action id")? },
         "start" => Request::Start { text: arg },
         other => return Err(format!("unknown action {other}")),
     })
@@ -132,14 +143,26 @@ fn apply_status(app: &AppHandle, status: &Status) {
     }
 }
 
-/// Forwards every daemon event to the window and keeps the tray in sync.
+/// A native notification for a check-in or note, unless the popover is already in front.
+/// Clicking it opens the popover (see the `on_action` handler in `main`).
+fn notify(app: &AppHandle, text: &str) {
+    let in_front = app.get_webview_window("main").is_some_and(|w| w.is_visible().unwrap_or(false));
+    if !in_front {
+        let _ = app.notification().builder().title("Focus Coach").body(text).show();
+    }
+}
+
+/// Forwards every daemon event to the window, keeps the tray in sync, and shows
+/// check-ins as notifications (the daemon skips its own while this is connected).
 async fn subscribe_loop(app: AppHandle, paths: Paths) {
     loop {
-        if let Ok(mut sub) = client::subscribe(&paths).await {
+        if let Ok(mut sub) = client::subscribe_as_notifier(&paths).await {
             let _ = app.emit("focus-connected", true);
             while let Ok(Some(ev)) = sub.next().await {
-                if let Event::Status { status } = &ev {
-                    apply_status(&app, status);
+                match &ev {
+                    Event::Status { status } => apply_status(&app, status),
+                    Event::CheckIn { text } | Event::Note { text } => notify(&app, text),
+                    _ => {}
                 }
                 let _ = app.emit("focus-event", &ev);
             }
@@ -154,6 +177,7 @@ fn menu_action(app: &AppHandle, id: &str) {
     let req = match id {
         "open" => return show_popover(app, None),
         "quit" => return app.exit(0),
+        "login" => return toggle_login(app),
         "next" => Request::Next,
         "pause" => Request::Pause,
         "resume" => Request::Resume,
@@ -176,6 +200,21 @@ fn menu_action(app: &AppHandle, id: &str) {
     });
 }
 
+/// The "Start at login" menu item: a launch agent for this app.
+struct LoginItem(CheckMenuItem<Wry>);
+
+fn toggle_login(app: &AppHandle) {
+    let autolaunch = app.autolaunch();
+    let on = autolaunch.is_enabled().unwrap_or(false);
+    let result = if on { autolaunch.disable() } else { autolaunch.enable() };
+    if let Err(e) = result {
+        let _ = app.emit("focus-event", Event::Error { turn: 0, text: format!("start at login: {e}") });
+    }
+    if let Some(item) = app.try_state::<LoginItem>() {
+        let _ = item.0.set_checked(autolaunch.is_enabled().unwrap_or(false));
+    }
+}
+
 fn main() {
     let paths = Paths::from_env().expect("resolving FOCUS_HOME");
     // A claude-code turn starts this same binary as its MCP tool server.
@@ -191,6 +230,8 @@ fn main() {
     }
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_autostart::Builder::new().macos_launcher(MacosLauncher::LaunchAgent).build())
         .manage(paths.clone())
         .invoke_handler(tauri::generate_handler![say, control, tasks, status])
         .setup(move |app| {
@@ -207,7 +248,13 @@ fn main() {
             });
             tauri::async_runtime::spawn(subscribe_loop(app.handle().clone(), paths.clone()));
 
+            // A click on a check-in notification opens the popover.
+            let handle = app.handle().clone();
+            app.notification().on_action(move |_| show_popover(&handle, None))?;
+
             let status_item = MenuItem::with_id(app, "status", "Starting…", false, None::<&str>)?;
+            let login_on = app.autolaunch().is_enabled().unwrap_or(false);
+            let login_item = CheckMenuItem::with_id(app, "login", "Start at login", true, login_on, None::<&str>)?;
             let menu = Menu::with_items(
                 app,
                 &[
@@ -219,10 +266,13 @@ fn main() {
                     &MenuItem::with_id(app, "resume", "Resume check-ins", true, None::<&str>)?,
                     &MenuItem::with_id(app, "report", "End-of-day report", true, None::<&str>)?,
                     &PredefinedMenuItem::separator(app)?,
+                    &login_item,
+                    &PredefinedMenuItem::separator(app)?,
                     &MenuItem::with_id(app, "quit", "Quit Focus Coach", true, None::<&str>)?,
                 ],
             )?;
             app.manage(StatusItem(status_item));
+            app.manage(LoginItem(login_item));
 
             TrayIconBuilder::with_id(TRAY_ID)
                 .icon(Image::from_bytes(include_bytes!("../icons/tray.png"))?)
@@ -275,6 +325,7 @@ mod tests {
             top: None,
             open: 0,
             session: None,
+            pending: vec![],
         }
     }
 
@@ -292,8 +343,13 @@ mod tests {
         assert!(matches!(control_request("next", None), Ok(Request::Next)));
         assert!(matches!(control_request("report", None), Ok(Request::Report)));
         assert!(matches!(control_request("add", Some("https://x.y".into())), Ok(Request::Add { url }) if url == "https://x.y"));
+        assert!(matches!(control_request("add", Some("renew passport".into())), Ok(Request::New { title, .. }) if title == "renew passport"));
         assert!(control_request("add", None).is_err());
         assert!(control_request("add", Some("  ".into())).is_err());
+        assert!(matches!(control_request("toggle", Some("t3".into())), Ok(Request::Toggle { id }) if id == "t3"));
+        assert!(matches!(control_request("approve", Some("a1".into())), Ok(Request::Approve { id }) if id == "a1"));
+        assert!(matches!(control_request("reject", Some("a1".into())), Ok(Request::Reject { id }) if id == "a1"));
+        assert!(control_request("toggle", None).is_err());
         assert!(matches!(control_request("start", Some("my PRs".into())), Ok(Request::Start { text: Some(_) })));
         assert!(control_request("explode", None).is_err());
     }

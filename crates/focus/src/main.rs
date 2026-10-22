@@ -1,3 +1,4 @@
+mod autostart;
 mod list;
 mod tui;
 
@@ -28,14 +29,29 @@ enum Command {
     Pause,
     /// Resume check-ins and summarize where things stand.
     Resume,
-    /// Fetch a link, summarize it and file it on the list.
-    Add { url: String },
+    /// Add a task instantly ("renew passport --due fri"), or file a link through the coach.
+    Add {
+        /// A title, or a URL to fetch and summarize
+        text: Vec<String>,
+        /// Section to add it to (default Inbox)
+        #[arg(long, short)]
+        section: Option<String>,
+        /// YYYY-MM-DD, today, tomorrow or a weekday
+        #[arg(long, short)]
+        due: Option<String>,
+    },
+    /// Approve an outgoing action the coach proposed; it then carries it out.
+    Approve { id: String },
+    /// Drop a proposed action without sending anything.
+    Reject { id: String },
     /// The next item, with a first step.
     Next,
     /// Pause and write the end-of-day report.
     Report,
     /// Send anything: a check-in reply, a question, a command.
     Say { text: Vec<String> },
+    /// Check in now (after the progress check, if one is set).
+    Checkin,
     /// Show the check-in state.
     Status,
     /// Print the task list.
@@ -50,6 +66,8 @@ enum Command {
     Daemon,
     /// Stop the daemon.
     Stop,
+    /// Start the daemon at login: on, off, or status.
+    Autostart { state: Option<String> },
     /// Serve the coach's tools over MCP to a claude-code turn (started by the daemon).
     #[command(hide = true)]
     Mcp { turn: u64 },
@@ -65,6 +83,7 @@ async fn main() -> Result<()> {
     let request = match command {
         Command::Daemon => return daemon::run(paths).await,
         Command::Mcp { turn } => return focus_core::mcp::serve_stdio(paths, turn).await,
+        Command::Autostart { state } => return autostart::run(&paths, state.as_deref()),
         Command::Tui => {
             ensure_daemon(&paths).await?;
             return tui::run(paths).await;
@@ -76,13 +95,16 @@ async fn main() -> Result<()> {
         Command::Start { text } => Request::Start { text: joined(text) },
         Command::Pause => Request::Pause,
         Command::Resume => Request::Resume,
-        Command::Add { url } => Request::Add { url },
+        Command::Add { text, section, due } => add_request(text, section, due)?,
+        Command::Approve { id } => Request::Approve { id },
+        Command::Reject { id } => Request::Reject { id },
         Command::Next => Request::Next,
         Command::Report => Request::Report,
         Command::Say { text } => match joined(text) {
             Some(text) => Request::Say { text },
             None => bail!("say what? e.g. focus say \"on the lodash PRs\""),
         },
+        Command::Checkin => Request::CheckIn,
         Command::Status => Request::Status,
         Command::Tasks { markdown } => {
             raw_tasks = markdown;
@@ -107,6 +129,19 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// A lone URL goes to the coach to fetch and file; anything else is a title added as is.
+fn add_request(words: Vec<String>, section: Option<String>, due: Option<String>) -> Result<Request> {
+    let Some(text) = joined(words) else {
+        bail!("add what? e.g. focus add \"renew passport\" --due fri, or focus add <url>")
+    };
+    let is_link = !text.contains(char::is_whitespace) && (text.starts_with("http://") || text.starts_with("https://"));
+    Ok(if is_link && section.is_none() && due.is_none() {
+        Request::Add { url: text }
+    } else {
+        Request::New { title: text, section, due }
+    })
 }
 
 fn joined(words: Vec<String>) -> Option<String> {
@@ -141,6 +176,7 @@ async fn ensure_daemon(paths: &Paths) -> Result<()> {
 fn print_event(event: &Event) {
     match event {
         Event::CheckIn { text } => println!("⏰ {text}"),
+        Event::Note { text } => println!("📝 {text}"),
         Event::Reply { text, .. } | Event::Ok { text } => println!("{text}"),
         Event::Question { text, .. } => println!("? {text}"),
         Event::Preview { kind, content, .. } => {
@@ -150,11 +186,21 @@ fn print_event(event: &Event) {
             }
             println!("└─");
         }
+        Event::Proposal { proposal: p, .. } => {
+            println!("┌─ {} {} to {} (awaiting approval)", p.id, p.kind, p.target);
+            for line in p.content.lines() {
+                println!("│ {line}");
+            }
+            println!("└─ focus approve {id} · focus reject {id}", id = p.id);
+        }
         Event::Changed { summary, .. } => println!("  · {summary}"),
         Event::Report { text, path, .. } => println!("{text}\n\nSaved to {path}"),
         Event::Error { text, .. } => eprintln!("error: {text}"),
         Event::Status { status } => {
             println!("{}", status.summary());
+            for p in &status.pending {
+                println!("awaiting approval: {} {} to {} (focus approve {})", p.id, p.kind, p.target, p.id);
+            }
             if let Some(id) = &status.session {
                 println!("Claude Code session {id} (open it with: claude --resume {id})");
             }

@@ -41,6 +41,24 @@ async fn start_with(tasks: &str, extra_config: impl FnOnce(&std::path::Path) -> 
     Harness { _dir: dir, paths, llm, daemon }
 }
 
+/// Sets top-level settings, replacing the test defaults for the same keys.
+async fn start_top(tasks: &str, top: &str) -> Harness {
+    let top = top.to_string();
+    start_with(tasks, move |home| {
+        let path = home.join("focus.toml");
+        let keys: Vec<&str> = top.lines().filter_map(|l| l.split_once('=')).map(|(k, _)| k.trim()).collect();
+        let rest: String = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.split_once('=').is_some_and(|(k, _)| keys.contains(&k.trim())))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        std::fs::write(&path, format!("{top}\n{rest}")).unwrap();
+        String::new()
+    })
+    .await
+}
+
 async fn spawn_daemon(paths: &Paths) -> JoinHandle<anyhow::Result<()>> {
     let handle = tokio::spawn(daemon::run(paths.clone()));
     for _ in 0..100 {
@@ -513,5 +531,179 @@ async fn read_only_lookups_stay_inside_repos_root() {
     assert!(results[2].contains("outside repos_root"), "{results:?}");
     assert!(results[3].contains("isn't connected yet"), "{results:?}");
     assert!(results[4].contains("Slack adapter"), "{results:?}");
+    h.stop().await;
+}
+
+#[tokio::test]
+async fn new_adds_a_task_without_the_model() {
+    let h = start(TASKS).await;
+    let events = h.send(Request::New { title: "Renew passport".into(), section: Some("Personal".into()), due: Some("2026-11-02".into()) }).await;
+    assert!(
+        matches!(&events[0], Event::Changed { summary, .. } if summary == "added t4 to Personal: Renew passport, due Mon 11/02"),
+        "{events:?}"
+    );
+    assert!(h.file("tasks.md").contains("## Personal\n\n- [ ] Renew passport {id=t4 due=2026-11-02}"), "{}", h.file("tasks.md"));
+    h.send(Request::New { title: "Call the bank".into(), section: None, due: None }).await;
+    assert!(h.file("tasks.md").contains("## Inbox\n\n- [ ] Call the bank {id=t5}"), "Inbox by default:\n{}", h.file("tasks.md"));
+
+    let events = h.send(Request::New { title: "x".into(), section: None, due: Some("someday".into()) }).await;
+    assert!(matches!(&events[0], Event::Error { text, .. } if text.contains("someday")), "{events:?}");
+    assert!(h.llm.requests().is_empty(), "adding never calls the model");
+    assert!(h.file("log.md").contains("· added"), "{}", h.file("log.md"));
+    h.stop().await;
+}
+
+#[tokio::test]
+async fn outgoing_actions_wait_for_approval() {
+    let h = start(TASKS).await;
+    let pr = "https://github.com/o/r/pull/7";
+    h.llm.script([
+        calls(&[("comment_on_github", json!({"url": pr, "body": "LGTM"}))]),
+        calls(&[("propose_action", json!({"kind": "pr comment", "target": pr, "content": "LGTM, merging after CI."}))]),
+        text("Proposed a1: a comment on the PR. /approve a1 to post it."),
+    ]);
+    let events = h.say("tell them it looks good on the PR").await;
+    assert!(tool_results(&h.llm.requests()[1])[0].contains("not approved"), "comments need approval first");
+    let proposal = events.iter().find_map(|e| match e {
+        Event::Proposal { proposal, .. } => Some(proposal.clone()),
+        _ => None,
+    });
+    let proposal = proposal.expect("a proposal event");
+    assert_eq!((proposal.id.as_str(), proposal.kind.as_str(), proposal.content.as_str()), ("a1", "pr comment", "LGTM, merging after CI."));
+    assert_eq!(h.status().await.pending, std::slice::from_ref(&proposal));
+    assert!(h.file("state.json").contains("LGTM, merging after CI."), "pending actions survive a restart");
+
+    // The next turn sees it waiting.
+    h.llm.script([text("Still waiting on a1.")]);
+    h.say("anything pending?").await;
+    let prompt = user_prompt(h.llm.requests().last().unwrap());
+    assert!(prompt.contains("<awaiting_approval>") && prompt.contains("a1: pr comment to"), "{prompt}");
+
+    // Approving runs one turn with exactly that action, on the strong model.
+    h.llm.script([text("Posting it now.")]);
+    let events = h.send(Request::Approve { id: "a1".into() }).await;
+    assert!(replies(&events).contains(&"Posting it now."), "{events:?}");
+    let request = h.llm.requests().last().unwrap().clone();
+    assert_eq!(request["model"], "mock-strong");
+    let prompt = user_prompt(&request);
+    assert!(prompt.contains("<approved_action id=\"a1\">") && prompt.contains("LGTM, merging after CI."), "{prompt}");
+    assert!(prompt.contains("<input kind=\"approved\">"), "{prompt}");
+    assert!(h.status().await.pending.is_empty());
+
+    let events = h.send(Request::Approve { id: "a1".into() }).await;
+    assert!(matches!(&events[0], Event::Error { text, .. } if text.contains("nothing awaiting approval")), "{events:?}");
+
+    // Rejecting drops one without a model call.
+    h.llm.script([calls(&[("propose_action", json!({"kind": "slack message", "target": "#team", "content": "hi"}))]), text("a2 ready.")]);
+    h.say("say hi to the team").await;
+    let calls_before = h.llm.requests().len();
+    let events = h.send(Request::Reject { id: "a2".into() }).await;
+    assert!(matches!(&events[0], Event::Ok { text } if text.contains("Dropped a2")), "{events:?}");
+    assert_eq!(h.llm.requests().len(), calls_before);
+    assert!(h.file("log.md").contains("rejected a2: slack message to #team"));
+    h.stop().await;
+}
+
+#[tokio::test]
+async fn note_to_self_needs_no_approval() {
+    let h = start(TASKS).await;
+    h.llm.script([calls(&[("note_to_self", json!({"text": "call the bank at 3"}))]), text("I'll remind you.")]);
+    let events = h.say("remind me to call the bank at 3").await;
+    assert!(changes(&events).contains(&"note to self: call the bank at 3"), "{events:?}");
+    assert!(h.status().await.pending.is_empty());
+    h.stop().await;
+}
+
+#[tokio::test]
+async fn the_first_message_of_the_day_runs_the_morning_bootstrap_once() {
+    let h = start_top(TASKS, "morning_bootstrap = \"Morning: check my PRs\"").await;
+    h.llm.script([text("Morning. Two PRs need you."), text("On it.")]);
+    let events = h.say("hi").await;
+    assert_eq!(replies(&events), ["Morning. Two PRs need you.", "On it."]);
+    let requests = h.llm.requests();
+    assert!(user_prompt(&requests[0]).contains("This is a bootstrap") && user_prompt(&requests[0]).contains("Morning: check my PRs"));
+    assert_eq!(requests[0]["model"], "mock-strong");
+    assert!(user_prompt(&requests[1]).contains("<input kind=\"message\">\nhi"));
+
+    h.llm.script([text("Sure.")]);
+    let events = h.say("again").await;
+    assert_eq!(replies(&events), ["Sure."], "only once a day");
+    assert!(h.file("state.json").contains(&format!("\"last_bootstrap\": \"{}\"", Local::now().date_naive())));
+    h.stop().await;
+}
+
+#[tokio::test]
+async fn check_ins_stay_inside_work_hours() {
+    // Every minute, but only 03:00-04:00 on Mondays: the next check-in is a Monday at 3.
+    let h = start_top(TASKS, "work_hours = \"3-4 Mon\"\nschedule = \"* * * * *\"").await;
+    let next = h.status().await.next_checkin.expect("a next check-in");
+    assert_eq!(next.format("%a %H").to_string(), "Mon 03", "{next}");
+    h.stop().await;
+
+    // Nonsense stops the daemon with a readable error rather than firing at random.
+    let dir = tempfile::tempdir().unwrap();
+    write_config(dir.path(), "http://unused");
+    let config = std::fs::read_to_string(dir.path().join("focus.toml")).unwrap();
+    std::fs::write(dir.path().join("focus.toml"), format!("work_hours = \"nine to five\"\n{config}")).unwrap();
+    let err = daemon::run(Paths { home: dir.path().to_path_buf() }).await.unwrap_err();
+    assert!(format!("{err:#}").contains("expected e.g. \"9-17 Mon-Fri\""), "{err:#}");
+}
+
+#[tokio::test]
+async fn the_end_of_day_report_runs_on_its_own() {
+    let now = Local::now();
+    if now.format("%H:%M").to_string().as_str() < "00:02" {
+        return; // A minute ago was yesterday.
+    }
+    let at = (now - chrono::Duration::minutes(1)).format("%H:%M");
+    let h = start_top(TASKS, &format!("work_hours = \"\"\nreport_at = \"{at}\"")).await;
+    h.llm.script([text("## Done\n- t1")]);
+    let report = h.paths.home.join("reports").join(format!("{}.md", now.date_naive()));
+    for _ in 0..100 {
+        if report.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(std::fs::read_to_string(&report).unwrap().contains("## Done"));
+    assert!(!h.status().await.paused, "the automatic report doesn't pause tomorrow's check-ins");
+    assert_eq!(h.llm.requests().len(), 1, "and runs once");
+    h.stop().await;
+}
+
+#[tokio::test]
+async fn the_progress_check_runs_right_before_a_check_in() {
+    let h = start_top(TASKS, "progress_check = \"check my PRs for progress\"\nwork_hours = \"\"").await;
+    h.llm.script([
+        calls(&[("check_off", json!({"task_id": "t1"}))]),
+        text("lodash PRs merged, so I checked off t1."),
+    ]);
+    let events = h.send(Request::CheckIn).await;
+    let Event::Ok { text: checkin } = &events[0] else { panic!("{events:?}") };
+    assert_eq!(checkin, "What are you on? Top of the list: Review billing docs (t2).\nlodash PRs merged, so I checked off t1.");
+
+    let request = &h.llm.requests()[0];
+    let prompt = user_prompt(request);
+    assert!(prompt.contains("This is a progress check") && prompt.contains("check my PRs for progress"), "{prompt}");
+    assert_eq!(request["model"], "mock-light");
+    assert!(h.file("tasks.md").contains("- [x] Cut lodash PRs"));
+    assert!(h.status().await.awaiting_reply, "it's still a check-in waiting for a reply");
+    let log = h.file("log.md");
+    assert!(log.contains("· progress check") && !log.contains("> check my PRs"), "{log}");
+
+    // Nothing new: the check-in is the plain one, and the log stays quiet.
+    h.llm.script([text("")]);
+    let events = h.send(Request::CheckIn).await;
+    assert!(matches!(&events[0], Event::Ok { text } if !text.contains('\n')), "{events:?}");
+    assert_eq!(h.file("log.md").matches("· progress check").count(), 1, "{}", h.file("log.md"));
+    h.stop().await;
+}
+
+#[tokio::test]
+async fn no_progress_check_when_it_is_blank() {
+    let h = start_top(TASKS, "work_hours = \"\"").await;
+    let events = h.send(Request::CheckIn).await;
+    assert!(matches!(&events[0], Event::Ok { text } if text.starts_with("What are you on?")), "{events:?}");
+    assert!(h.llm.requests().is_empty(), "a blank progress_check never calls the model");
     h.stop().await;
 }

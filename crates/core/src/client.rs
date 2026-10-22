@@ -53,5 +53,10 @@ impl Subscription {
 }
 
 pub async fn subscribe(paths: &Paths) -> Result<Subscription> {
-    Ok(Subscription { conn: send(paths, &Request::Subscribe).await? })
+    Ok(Subscription { conn: send(paths, &Request::Subscribe { notifies: false }).await? })
+}
+
+/// Subscribes as the client that shows check-in notifications, so the daemon skips its own.
+pub async fn subscribe_as_notifier(paths: &Paths) -> Result<Subscription> {
+    Ok(Subscription { conn: send(paths, &Request::Subscribe { notifies: true }).await? })
 }

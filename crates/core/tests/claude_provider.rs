@@ -20,7 +20,7 @@ async fn start(llm: &MockLlm) -> (tempfile::TempDir, Paths) {
     let base = llm.url.trim_end_matches("/v1");
     std::fs::write(
         dir.path().join("focus.toml"),
-        format!("schedule = \"0 3 1 1 *\"\nnotifier = \"terminal\"\n[llm]\nprovider = \"claude\"\nbase_url = \"{base}\"\n"),
+        format!("schedule = \"0 3 1 1 *\"\nnotifier = \"terminal\"\nmorning_bootstrap = \"\"\nreport_at = \"off\"\n[llm]\nprovider = \"claude\"\nbase_url = \"{base}\"\n"),
     )
     .unwrap();
     std::fs::write(dir.path().join("tasks.md"), "## Today\n- [ ] Ship it {id=t1}\n").unwrap();

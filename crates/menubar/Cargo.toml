@@ -13,6 +13,8 @@ serde_json.workspace = true
 tokio.workspace = true
 focus-core.workspace = true
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-notification = "2"
+tauri-plugin-autostart = "2"
 
 [dev-dependencies]
 tempfile = "3"

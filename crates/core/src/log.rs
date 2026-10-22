@@ -76,6 +76,26 @@ impl Log {
         entries[entries.len().saturating_sub(n)..].to_vec()
     }
 
+    /// Deletes entries older than `keep_days` (0 keeps everything). Returns how many went.
+    pub fn prune(&self, keep_days: u32, today: NaiveDate) -> Result<usize> {
+        if keep_days == 0 {
+            return Ok(0);
+        }
+        let cutoff = (today - chrono::Days::new(keep_days.into())).format("%Y-%m-%d").to_string();
+        let entries = self.entries();
+        // Undated text (anything not under a "## YYYY-MM-DD" heading) is kept.
+        let keep: Vec<&String> =
+            entries.iter().filter(|e| e.get(3..13).is_none_or(|d| d.parse::<NaiveDate>().is_err() || d >= cutoff.as_str())).collect();
+        let removed = entries.len() - keep.len();
+        if removed > 0 {
+            let text: String = keep.iter().map(|e| format!("\n{e}\n")).collect();
+            let tmp = self.path.with_extension("md.tmp");
+            std::fs::write(&tmp, text)?;
+            std::fs::rename(&tmp, &self.path)?;
+        }
+        Ok(removed)
+    }
+
     /// Every entry dated on or after `since`.
     pub fn since(&self, since: NaiveDate) -> Vec<String> {
         let prefix = since.format("%Y-%m-%d").to_string();
@@ -83,5 +103,33 @@ impl Log {
             .into_iter()
             .filter(|e| e.get(3..13).is_some_and(|d| d >= prefix.as_str()))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prune_drops_old_entries_and_keeps_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.md");
+        std::fs::write(
+            &path,
+            "\n## 2026-09-01 09:07 · check-in\n\nOld.\n\n## 2026-10-20 09:07 · reply\n> on it\n\nRecent.\n\n## 2026-10-22 10:00 · message\n\nToday.\n",
+        )
+        .unwrap();
+        let log = Log::new(&path);
+        let today = NaiveDate::from_ymd_opt(2026, 10, 22).unwrap();
+
+        assert_eq!(log.prune(0, today).unwrap(), 0, "0 keeps everything");
+        assert_eq!(log.prune(30, today).unwrap(), 1);
+        let entries = log.entries();
+        assert_eq!(entries.len(), 2);
+        assert!(entries[0].contains("> on it") && entries[1].contains("Today."), "{entries:?}");
+        assert_eq!(log.prune(30, today).unwrap(), 0);
+
+        log.append(&LogEntry::new("message", "after pruning")).unwrap();
+        assert_eq!(log.entries().len(), 3, "appending still works");
     }
 }

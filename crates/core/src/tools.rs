@@ -86,6 +86,18 @@ pub fn definitions() -> Vec<Value> {
             "kind": {"type": "string", "description": "e.g. \"slack message\", \"commit message\""},
             "content": {"type": "string"},
         }), &["kind", "content"]),
+        tool("propose_action", "Propose something outgoing (a Slack message, a PR or issue comment, an email, a saved draft, a commit) and stop. Nothing happens until the person approves it with /approve <id>; then you get an approved turn to carry it out.", json!({
+            "kind": {"type": "string", "description": "e.g. \"slack message\", \"pr comment\", \"email draft\""},
+            "target": {"type": "string", "description": "Where it goes: a channel, a PR URL, a person"},
+            "content": {"type": "string", "description": "Exactly what will be sent or saved"},
+        }), &["kind", "target", "content"]),
+        tool("note_to_self", "Send the person a note as a notification and keep it in the log. Only when they ask for a reminder or a note to self; needs no approval.", json!({
+            "text": {"type": "string"},
+        }), &["text"]),
+        tool("comment_on_github", "Post a comment on a GitHub PR or issue through gh. Only works in an approved turn, for the approved action.", json!({
+            "url": {"type": "string", "description": "The PR or issue URL"},
+            "body": {"type": "string"},
+        }), &["url", "body"]),
     ]
 }
 
@@ -303,6 +315,34 @@ async fn run(app: &Arc<App>, ctx: &mut TurnCtx, name: &str, input: &Value) -> Re
             let content = req(input, "content")?.to_string();
             app.emit(Event::Preview { turn: ctx.turn, kind, content });
             Ok("Shown to the person. Nothing was sent or saved.".into())
+        }
+        "propose_action" => {
+            let proposal = app.propose(req(input, "kind")?, req(input, "target")?, req(input, "content")?);
+            let id = proposal.id.clone();
+            record(app, ctx, format!("proposed {id}: {} to {}", proposal.kind, proposal.target));
+            app.emit(Event::Proposal { turn: ctx.turn, proposal });
+            Ok(format!(
+                "Proposed as {id}. Nothing was sent. End your turn: say what you proposed and that they can /approve {id} or /reject {id}."
+            ))
+        }
+        "note_to_self" => {
+            let text = req(input, "text")?.to_string();
+            app.notify(&text).await;
+            record(app, ctx, format!("note to self: {text}"));
+            Ok("Sent to the person as a notification and logged.".into())
+        }
+        "comment_on_github" => {
+            let url = req(input, "url")?;
+            let body = req(input, "body")?;
+            let Some(approved) = &ctx.approved else {
+                bail!("not approved: call propose_action and wait for the person to approve it");
+            };
+            if approved.target.trim() != url.trim() {
+                bail!("the approved action {} targets {}, not {url}", approved.id, approved.target);
+            }
+            let posted = lookup::comment_on_github(url, body).await?;
+            record(app, ctx, format!("{}: commented on {url}", approved.id));
+            Ok(posted)
         }
         other => bail!("unknown tool {other}"),
     }

@@ -17,7 +17,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use chrono::{Local, NaiveDate};
+use chrono::{Datelike, Local, NaiveDate};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -332,6 +332,25 @@ impl TaskList {
     }
 }
 
+/// A due date as people type it: YYYY-MM-DD, "today", "tomorrow", or a weekday name
+/// (the next one after today, so "fri" on a Friday means a week out).
+pub fn parse_due(text: &str, today: NaiveDate) -> Result<NaiveDate> {
+    let text = text.trim().to_lowercase();
+    if let Ok(date) = text.parse::<NaiveDate>() {
+        return Ok(date);
+    }
+    match text.as_str() {
+        "today" => return Ok(today),
+        "tomorrow" => return Ok(today + chrono::Days::new(1)),
+        _ => {}
+    }
+    let Ok(day) = text.parse::<chrono::Weekday>() else {
+        bail!("can't read due date {text:?}; use YYYY-MM-DD, today, tomorrow or a weekday");
+    };
+    let ahead = (day.num_days_from_monday() + 7 - today.weekday().num_days_from_monday()) % 7;
+    Ok(today + chrono::Days::new(if ahead == 0 { 7 } else { ahead.into() }))
+}
+
 fn normalize_id(id: &str) -> String {
     let id = id.trim().trim_start_matches('#');
     if id.chars().all(|c| c.is_ascii_digit()) { format!("t{id}") } else { id.to_string() }
@@ -518,6 +537,18 @@ mod tests {
 
     fn day(d: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(2026, 10, d).unwrap()
+    }
+
+    #[test]
+    fn due_dates_as_people_type_them() {
+        let thu = day(22);
+        assert_eq!(parse_due("2026-11-02", thu).unwrap(), NaiveDate::from_ymd_opt(2026, 11, 2).unwrap());
+        assert_eq!(parse_due("today", thu).unwrap(), thu);
+        assert_eq!(parse_due("Tomorrow", thu).unwrap(), day(23));
+        assert_eq!(parse_due("fri", thu).unwrap(), day(23));
+        assert_eq!(parse_due("monday", thu).unwrap(), day(26));
+        assert_eq!(parse_due("thu", thu).unwrap(), day(29), "the same weekday means next week");
+        assert!(parse_due("soonish", thu).is_err());
     }
 
     #[test]

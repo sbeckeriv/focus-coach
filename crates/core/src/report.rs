@@ -27,10 +27,10 @@ Be brief: one line per item, keep task ids, no preamble. Use they/them for the p
 pub(crate) async fn generate(app: &App) -> Result<(String, PathBuf)> {
     let today = Local::now().date_naive();
     let list = app.store.load()?;
-    let log = app.log.since(today - Duration::days(7));
+    let since = today - Duration::days(app.settings.report_lookback_days.into());
+    let log = app.log.since(since);
     // Finished items move to done.md, one section per day; bring back the last week of them.
     let mut done = app.store.load_done()?;
-    let since = today - Duration::days(7);
     done.sections.retain(|s| s.name.parse::<NaiveDate>().is_ok_and(|d| d >= since));
     let prompt = format!(
         "Today is {}.\n\n<task_list>\n{}</task_list>\n\n<done_archive since=\"{since}\">\n{}</done_archive>\n\n<log since=\"{since}\">\n{}\n</log>",

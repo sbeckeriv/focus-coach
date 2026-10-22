@@ -95,7 +95,18 @@ button:disabled { opacity: 0.5; cursor: default; }
 .section.held h3 { font-style: italic; text-transform: none; letter-spacing: 0; }
 
 .task { display: flex; gap: 6px; align-items: baseline; padding: 1px 0; }
-.task .mark { width: 12px; flex-shrink: 0; text-align: center; color: var(--muted); }
+.task .mark {
+  width: 18px;
+  flex-shrink: 0;
+  text-align: center;
+  color: var(--muted);
+  background: none;
+  border: none;
+  border-radius: 4px;
+  padding: 0;
+  font-size: 13px;
+}
+.task .mark:hover { background: var(--accent-soft); color: var(--accent); }
 .task .id, .task .due { font-size: 11px; color: var(--muted); flex-shrink: 0; }
 .task .name { flex: 1; min-width: 0; }
 .task.top { background: var(--accent-soft); border-radius: 4px; margin: 0 -4px; padding: 1px 4px; }
@@ -130,6 +141,9 @@ button:disabled { opacity: 0.5; cursor: default; }
   font-size: 12px;
 }
 .msg.preview .label { display: block; font-family: inherit; color: var(--muted); margin-bottom: 4px; }
+.msg.proposal { border-style: solid; border-color: var(--accent); }
+.msg.proposal .choices { display: flex; gap: 6px; margin-top: 8px; font-family: -apple-system, BlinkMacSystemFont, sans-serif; }
+.msg.proposal .approve { background: var(--accent); border-color: var(--accent); color: #fff; }
 .msg.thinking { color: var(--muted); font-style: italic; }
 
 #composer {

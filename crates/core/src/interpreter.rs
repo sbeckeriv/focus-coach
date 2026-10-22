@@ -8,6 +8,8 @@ use serde_json::json;
 
 use crate::daemon::App;
 use crate::log::LogEntry;
+use crate::config::LlmSettings;
+use crate::protocol::Proposal;
 use crate::provider::{Provider, Tier};
 use crate::tools;
 
@@ -23,12 +25,16 @@ pub enum InputKind {
     Resume,
     /// End-of-day report, run directly by the reporter.
     Report,
+    /// The person approved a proposed outgoing action; carry it out.
+    Approved,
+    /// `progress_check`, run just before a check-in: pick up progress and new work.
+    Progress,
 }
 
 impl InputKind {
     /// Whether this counts as "the person's next message" for pause-until-next-message.
     pub fn is_from_person(self) -> bool {
-        matches!(self, InputKind::Message | InputKind::Bootstrap)
+        matches!(self, InputKind::Message | InputKind::Bootstrap | InputKind::Approved)
     }
 }
 
@@ -37,6 +43,8 @@ pub(crate) struct TurnCtx {
     pub turn: u64,
     pub changes: Vec<String>,
     pub summary: Option<String>,
+    /// Set in an approved turn: the one outgoing action it may carry out.
+    pub approved: Option<Proposal>,
 }
 
 const SYSTEM_PROMPT: &str = r#"You are Focus Coach, a local assistant that keeps one person on track during their workday. You keep their task list, read their check-in replies and commands, and do small jobs on list items: lookups, explanations, drafts and readiness checks.
@@ -56,7 +64,7 @@ How to behave:
 10. Progress updates ("I cut PRs for lodash", "meeting went well"): check off what's done; use split_task when part of an item is done and part remains.
 11. Answer the question asked. For yes/no questions, say yes or no first, then the reason. For design questions, answer, recommend, and say so plainly when an earlier framing (yours included) was wrong.
 12. "What's next?" gets the next item and one concrete first step.
-13. You can't send messages, commit, open, merge or close anything yet. When asked to write something outgoing, draft it and show it with preview, in the style of the destination (for a commit message, match the repo's recent commits).
+13. Nothing outgoing without approval. To send a message, post a comment, save a draft somewhere, commit, open, merge or close anything, call propose_action with the exact content, written in the style of the destination (for a commit message, match the repo's recent commits), and stop. The person approves with /approve <id>. In an approved turn, carry out exactly that action and nothing else, then say what you did. preview shows a draft without proposing it; note_to_self needs no approval when they ask for it.
 14. If a declined or failed action can't be done, don't retry it; offer another route.
 15. Use they/them for the person in anything you write about them.
 16. When input is ambiguous, call ask_user with one short question and stop.
@@ -74,8 +82,8 @@ fn mcp_exe() -> Result<std::path::PathBuf> {
     }
 }
 
-fn choose_tier(input: &str, kind: InputKind) -> Tier {
-    if kind == InputKind::Bootstrap {
+fn choose_tier(input: &str, kind: InputKind, llm: &LlmSettings) -> Tier {
+    if matches!(kind, InputKind::Bootstrap | InputKind::Approved) {
         return Tier::Strong;
     }
     if kind != InputKind::Message {
@@ -83,17 +91,16 @@ fn choose_tier(input: &str, kind: InputKind) -> Tier {
     }
     let lower = input.to_lowercase();
     let words = input.split_whitespace().count();
-    let design = ["explain", "why ", "how would", "how do we", "can we", "confused", "do we have enough"]
-        .iter()
-        .any(|k| lower.contains(k));
-    if input.len() > 400 || lower.contains("http") || design || (input.contains('?') && words > 14) {
+    let keyword = llm.strong_keywords.iter().any(|k| lower.contains(&k.to_lowercase()));
+    let long_question = input.contains('?') && words > llm.strong_question_words;
+    if input.len() >= llm.strong_min_chars || lower.contains("http") || keyword || long_question {
         Tier::Strong
     } else {
         Tier::Light
     }
 }
 
-fn context_block(app: &App, kind: InputKind, was_reply: bool) -> Result<String> {
+fn context_block(app: &App, kind: InputKind, was_reply: bool, approved: Option<&Proposal>) -> Result<String> {
     let list = app.store.load()?;
     let now = Local::now();
     let mut out = format!("Now: {}\n", now.format("%a %Y-%m-%d %H:%M"));
@@ -105,8 +112,15 @@ fn context_block(app: &App, kind: InputKind, was_reply: bool) -> Result<String> 
             let next = rt.next_checkin.map(|t| t.format("%a %H:%M").to_string()).unwrap_or("none".into());
             out.push_str(&format!("Check-ins: active, schedule `{}`, next {next}.\n", rt.schedule));
         }
-        if let Some(hours) = &app.settings.work_hours {
-            out.push_str(&format!("Configured work hours: {hours}.\n"));
+        if !app.settings.work_hours.trim().is_empty() {
+            out.push_str(&format!("Work hours: {} (check-ins only fire inside them).\n", app.settings.work_hours));
+        }
+        if !rt.pending.is_empty() {
+            out.push_str("\n<awaiting_approval>\n");
+            for p in &rt.pending {
+                out.push_str(&format!("{}: {} to {}\n{}\n\n", p.id, p.kind, p.target, p.content));
+            }
+            out.push_str("</awaiting_approval>\n");
         }
         if was_reply && let Some(last) = &rt.last_checkin {
             out.push_str(&format!("This input answers the check-in: \"{last}\"\n"));
@@ -124,12 +138,17 @@ fn context_block(app: &App, kind: InputKind, was_reply: bool) -> Result<String> 
     }
     let sources = &app.settings.sources;
     out.push_str(&format!(
-        "Sources: github {} (via gh), repos_root {}, Slack/Notion/Jira not connected yet.\n",
+        "Sources: github {} (via gh), repos_root {}, Slack/Notion/Jira {}.\n",
         sources.github_org.as_deref().map(|o| format!("org {o}")).unwrap_or("any org".into()),
         sources.repos_root.as_ref().map(|p| p.display().to_string()).unwrap_or("not set".into()),
+        if matches!(app.provider, Provider::ClaudeCode(_)) && app.settings.llm.claude_code_user_mcp {
+            "through your MCP tools if you have them (otherwise not connected)"
+        } else {
+            "not connected yet"
+        },
     ));
     out.push_str(&format!("\n<task_list>\n{}</task_list>\n", list.render()));
-    let recent = app.log.recent(10);
+    let recent = app.log.recent(app.settings.recent_log_entries);
     if !recent.is_empty() {
         out.push_str(&format!("\n<recent_log>\n{}\n</recent_log>\n", recent.join("\n\n")));
     }
@@ -140,19 +159,38 @@ fn context_block(app: &App, kind: InputKind, was_reply: bool) -> Result<String> 
              short overview and the top item.\n",
         );
     }
+    if kind == InputKind::Progress {
+        out.push_str(
+            "\nThis is a progress check, run just before a check-in while the person may be busy. Look at \
+             the sources the input names. Check off a task only when a source clearly shows it's done (a \
+             merged PR, a resolved thread); add a task only when a source says it's the person's. When \
+             something only might be done or new, don't change the list: mention it instead. Don't ask \
+             questions or propose actions. Reply with one short line saying what you changed or noticed, \
+             or with nothing at all when there's nothing new; it's shown with the check-in.\n",
+        );
+    }
+    if let Some(p) = approved {
+        out.push_str(&format!(
+            "\n<approved_action id=\"{}\">\nThe person approved this. Carry it out now, exactly as written, then say what you did.\nkind: {}\ntarget: {}\n{}\n</approved_action>\n",
+            p.id, p.kind, p.target, p.content
+        ));
+    }
     Ok(out)
 }
 
 pub(crate) async fn run(app: &Arc<App>, turn: u64, input: &str, kind: InputKind, was_reply: bool) -> Result<String> {
+    let approved = if kind == InputKind::Approved { app.rt().approving.take() } else { None };
     let label = match (kind, was_reply) {
         (InputKind::Bootstrap, _) => "bootstrap",
         (InputKind::Resume, _) => "resume",
+        (InputKind::Approved, _) => "approved",
+        (InputKind::Progress, _) => "progress check",
         (_, true) => "check-in reply",
         _ => "message",
     };
-    let framed = format!("{}\n<input kind=\"{label}\">\n{input}\n</input>", context_block(app, kind, was_reply)?);
-    let mut ctx = TurnCtx { turn, changes: Vec::new(), summary: None };
-    let tier = choose_tier(input, kind);
+    let framed = format!("{}\n<input kind=\"{label}\">\n{input}\n</input>", context_block(app, kind, was_reply, approved.as_ref())?);
+    let mut ctx = TurnCtx { turn, changes: Vec::new(), summary: None, approved };
+    let tier = choose_tier(input, kind, &app.settings.llm);
 
     let reply = if let Provider::ClaudeCode(cc) = &app.provider {
         // Claude Code runs the loop; the coach's tools come back in through `focus mcp`.
@@ -176,9 +214,14 @@ pub(crate) async fn run(app: &Arc<App>, turn: u64, input: &str, kind: InputKind,
         if label == "check-in reply" { "reply" } else { label },
         ctx.summary.clone().unwrap_or_else(|| first_line(&reply)),
     );
-    entry.user_reply = (kind != InputKind::Resume).then(|| input.to_string());
+    // Resumes and progress checks are the coach's own prompts, not the person's words.
+    entry.user_reply = (!matches!(kind, InputKind::Resume | InputKind::Progress)).then(|| input.to_string());
     entry.changes = ctx.changes;
-    app.log.append(&entry)?;
+    // A progress check that found nothing isn't worth a log entry every 20 minutes.
+    let quiet = kind == InputKind::Progress && entry.changes.is_empty() && reply.trim().is_empty();
+    if !quiet {
+        app.log.append(&entry)?;
+    }
     Ok(reply)
 }
 
@@ -225,9 +268,15 @@ mod tests {
 
     #[test]
     fn tiers() {
-        assert_eq!(choose_tier("yup. trying option b.", InputKind::Message), Tier::Light);
-        assert_eq!(choose_tier("https://x.y/z add to the list", InputKind::Message), Tier::Strong);
-        assert_eq!(choose_tier("can we make the change now?", InputKind::Message), Tier::Strong);
-        assert_eq!(choose_tier("look at my PRs", InputKind::Bootstrap), Tier::Strong);
+        let mut llm = LlmSettings::default();
+        assert_eq!(choose_tier("yup. trying option b.", InputKind::Message, &llm), Tier::Light);
+        assert_eq!(choose_tier("https://x.y/z add to the list", InputKind::Message, &llm), Tier::Strong);
+        assert_eq!(choose_tier("can we make the change now?", InputKind::Message, &llm), Tier::Strong);
+        assert_eq!(choose_tier("look at my PRs", InputKind::Bootstrap, &llm), Tier::Strong);
+        llm.strong_keywords = vec!["refactor".into()];
+        assert_eq!(choose_tier("can we make the change now?", InputKind::Message, &llm), Tier::Light, "keywords come from config");
+        assert_eq!(choose_tier("plan the refactor", InputKind::Message, &llm), Tier::Strong);
+        llm.strong_min_chars = 10;
+        assert_eq!(choose_tier("on it, nearly done", InputKind::Message, &llm), Tier::Strong);
     }
 }

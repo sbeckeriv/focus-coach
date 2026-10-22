@@ -131,6 +131,8 @@ pub fn write_config(home: &Path, llm_url: &str) {
         r#"schedule = "0 3 1 1 *"
 notifier = "terminal"
 miss_threshold = 3
+morning_bootstrap = ""
+report_at = "off"
 
 [llm]
 provider = "openai"

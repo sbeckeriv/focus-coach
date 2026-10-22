@@ -20,7 +20,7 @@ use ratatui::widgets::{Block, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 use tokio::sync::mpsc;
 
-const HELP: &str = "Type anything to talk to the coach. Commands: /next /pause /resume /report /add <url> /start [sources] /quit. Click a task's mark to check it off, or its title for details.";
+const HELP: &str = "Type anything to talk to the coach. Commands: /next /pause /resume /report /add <title or url> /approve <id> /reject <id> /start [sources] /quit. Click a task's mark to check it off, or its title for details.";
 
 enum Msg {
     Key(TermEvent),
@@ -37,6 +37,8 @@ enum Entry {
     Coach(String),
     Question(String),
     Preview { kind: String, content: String },
+    /// An outgoing action waiting for /approve.
+    Proposal(String),
     /// Details of a clicked task.
     Task(String),
     Change(String),
@@ -186,6 +188,14 @@ impl Ui {
     fn on_event(&mut self, ev: Event) {
         let entry = match ev {
             Event::CheckIn { text } => Entry::CheckIn(text),
+            Event::Note { text } => Entry::Info(format!("note to self: {text}")),
+            Event::Proposal { proposal: p, .. } => Entry::Proposal(format!(
+                "{id} {} to {}, awaiting approval: /approve {id} or /reject {id}\n{}",
+                p.kind,
+                p.target,
+                p.content,
+                id = p.id
+            )),
             Event::Reply { text, .. } | Event::Ok { text } => Entry::Coach(text),
             Event::Question { text, .. } => Entry::Question(text),
             Event::Preview { kind, content, .. } => Entry::Preview { kind, content },
@@ -455,13 +465,14 @@ impl Ui {
                 Entry::Preview { kind, content } => {
                     ("│    ", Style::new().fg(Color::Gray), format!("{kind} (preview, not sent)\n{content}"))
                 }
+                Entry::Proposal(t) => ("┃    ", Style::new().fg(Color::Magenta), t.clone()),
                 Entry::Change(t) => ("  ·  ", Style::new().dim(), t.clone()),
                 Entry::Task(t) => ("▸    ", Style::new().fg(Color::Yellow), t.clone()),
                 Entry::Error(t) => ("err  ", Style::new().fg(Color::Red), t.clone()),
                 Entry::Info(t) => ("     ", Style::new().dim().italic(), t.clone()),
             };
             for (i, chunk) in wrap(&text, width.saturating_sub(prefix.chars().count()).max(10)).into_iter().enumerate() {
-                let keep_gutter = i == 0 || matches!(entry, Entry::Preview { .. });
+                let keep_gutter = i == 0 || matches!(entry, Entry::Preview { .. } | Entry::Proposal(_));
                 let lead = if keep_gutter { prefix.to_string() } else { " ".repeat(prefix.chars().count()) };
                 out.push(Line::from(vec![Span::styled(lead, style), Span::styled(chunk, style)]));
             }
@@ -491,12 +502,32 @@ fn parse_input(text: &str) -> Input {
         "/pause" => Request::Pause,
         "/resume" => Request::Resume,
         "/report" => Request::Report,
-        "/add" if !arg.is_empty() => Request::Add { url: arg.into() },
+        "/add" if !arg.is_empty() => add_request(arg),
+        "/approve" if !arg.is_empty() => Request::Approve { id: arg.into() },
+        "/reject" if !arg.is_empty() => Request::Reject { id: arg.into() },
         "/start" => Request::Start { text: (!arg.is_empty()).then(|| arg.to_string()) },
         c if c.starts_with('/') => return Input::Unknown(c.to_string()),
         _ => Request::Say { text: text.to_string() },
     };
     Input::Send(request)
+}
+
+/// `/add` takes a URL (fetched by the coach) or a title with optional `--due` and
+/// `--section` (added as is).
+fn add_request(arg: &str) -> Request {
+    if !arg.contains(char::is_whitespace) && (arg.starts_with("http://") || arg.starts_with("https://")) {
+        return Request::Add { url: arg.into() };
+    }
+    let (mut title, mut section, mut due) = (Vec::new(), None, None);
+    let mut words = arg.split_whitespace();
+    while let Some(word) = words.next() {
+        match word {
+            "--due" | "-d" => due = words.next().map(String::from),
+            "--section" | "-s" => section = words.next().map(String::from),
+            _ => title.push(word),
+        }
+    }
+    Request::New { title: title.join(" "), section, due }
 }
 
 /// Word-wraps each line of `text` to `width` columns.
@@ -573,6 +604,7 @@ mod tests {
             top: None,
             open: 2,
             session: None,
+            pending: vec![],
         }
     }
 
@@ -583,7 +615,12 @@ mod tests {
         assert!(matches!(parse_input("/add https://x.y"), Input::Send(Request::Add { url }) if url == "https://x.y"));
         assert!(matches!(parse_input("/start"), Input::Send(Request::Start { text: None })));
         assert!(matches!(parse_input("/start look at my PRs"), Input::Send(Request::Start { text: Some(t) }) if t == "look at my PRs"));
-        assert!(matches!(parse_input("/add"), Input::Unknown(_)), "/add needs a URL");
+        assert!(matches!(parse_input("/add"), Input::Unknown(_)), "/add needs something to add");
+        assert!(matches!(parse_input("/add renew passport --due fri -s Personal"),
+            Input::Send(Request::New { title, section: Some(s), due: Some(d) }) if title == "renew passport" && s == "Personal" && d == "fri"));
+        assert!(matches!(parse_input("/add call mom"), Input::Send(Request::New { title, section: None, due: None }) if title == "call mom"));
+        assert!(matches!(parse_input("/approve a2"), Input::Send(Request::Approve { id }) if id == "a2"));
+        assert!(matches!(parse_input("/reject a2"), Input::Send(Request::Reject { id }) if id == "a2"));
         assert!(matches!(parse_input("/nope"), Input::Unknown(c) if c == "/nope"));
         assert!(matches!(parse_input("/q"), Input::Quit));
         assert!(matches!(parse_input("yup. trying option b."), Input::Send(Request::Say { text }) if text == "yup. trying option b."));

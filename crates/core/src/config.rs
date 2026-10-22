@@ -63,12 +63,29 @@ impl Paths {
 pub struct Settings {
     /// Cron expression: minute hour day-of-month month day-of-week.
     pub schedule: String,
-    /// Free-form, e.g. "9-17 Mon-Fri". Given to the model when it changes the schedule.
-    pub work_hours: Option<String>,
+    /// e.g. "9-17 Mon-Fri" or "9:30-17:30 Mon,Tue,Thu". Check-ins only fire inside these
+    /// hours, and the end-of-day report runs at the end. Empty means any time.
+    pub work_hours: String,
     pub miss_threshold: u32,
     pub notifier: Notifier,
     /// Days a done item stays on the list before moving to done.md; 0 moves it right away.
     pub archive_after_days: u32,
+    /// Days of log.md to keep; older entries are deleted. 0 keeps everything.
+    pub log_keep_days: u32,
+    /// When the end-of-day report runs on work days: "end" (end of work hours), "HH:MM", or "off".
+    pub report_at: String,
+    /// Days of log and done items the report covers.
+    pub report_lookback_days: u32,
+    /// Run at the first message or check-in of each day, before anything else. Empty turns it off.
+    pub morning_bootstrap: String,
+    /// Run right before each check-in to pick up progress and new work from your sources,
+    /// e.g. "check my PRs and Slack for progress on my tasks or new tasks". Empty: off.
+    pub progress_check: String,
+    /// Skip a check-in that would fire more than this many minutes late (e.g. after sleep).
+    pub late_checkin_minutes: u32,
+    /// How much of the conversation each turn sees: recent exchanges and log entries.
+    pub recent_turns: usize,
+    pub recent_log_entries: usize,
     pub llm: LlmSettings,
     pub sources: Sources,
 }
@@ -77,10 +94,18 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             schedule: "7,27,47 9-17 * * 1-5".into(),
-            work_hours: Some("9-17 Mon-Fri".into()),
+            work_hours: "9-17 Mon-Fri".into(),
             miss_threshold: 3,
             notifier: Notifier::Desktop,
             archive_after_days: 1,
+            log_keep_days: 30,
+            report_at: "end".into(),
+            report_lookback_days: 7,
+            morning_bootstrap: DEFAULT_BOOTSTRAP.into(),
+            progress_check: String::new(),
+            late_checkin_minutes: 5,
+            recent_turns: 6,
+            recent_log_entries: 10,
             llm: LlmSettings::default(),
             sources: Sources::default(),
         }
@@ -115,6 +140,18 @@ pub struct LlmSettings {
     /// Building the list, long docs, design questions, reports.
     pub strong_model: String,
     pub strong_effort: String,
+    /// Words that send a message to the strong model.
+    pub strong_keywords: Vec<String>,
+    /// Messages at least this long go to the strong model.
+    pub strong_min_chars: usize,
+    /// Questions with more words than this go to the strong model.
+    pub strong_question_words: usize,
+    /// provider = "claude-code": tools Claude Code may use without asking. Add your own
+    /// MCP servers here (e.g. "mcp__slack") to let the coach use them.
+    pub claude_code_tools: Vec<String>,
+    /// provider = "claude-code": load your own Claude Code MCP servers (Slack, Notion...)
+    /// next to the coach's. Off, only the coach's tools are loaded.
+    pub claude_code_user_mcp: bool,
 }
 
 impl Default for LlmSettings {
@@ -129,6 +166,19 @@ impl Default for LlmSettings {
             light_effort: "low".into(),
             strong_model: "claude-opus-5-5".into(),
             strong_effort: "high".into(),
+            strong_keywords: [
+                "explain", "why ", "how would", "how do we", "can we", "confused", "do we have enough",
+            ]
+            .map(String::from)
+            .into(),
+            strong_min_chars: 400,
+            strong_question_words: 14,
+            claude_code_tools: [
+                "Bash", "Read", "Edit", "Write", "Glob", "Grep", "WebFetch", "WebSearch", "mcp__focus",
+            ]
+            .map(String::from)
+            .into(),
+            claude_code_user_mcp: true,
         }
     }
 }
@@ -142,13 +192,25 @@ pub struct Sources {
     pub repos_root: Option<PathBuf>,
 }
 
+pub const DEFAULT_BOOTSTRAP: &str = "Morning: check my open PRs, review requests and PRs merged since yesterday (gh), carry over yesterday's open items, and update the list.";
+
 const DEFAULT_CONFIG: &str = r#"# Focus Coach settings. Delete a line to fall back to its default.
 
 schedule = "7,27,47 9-17 * * 1-5"   # minute hour day-of-month month day-of-week
-work_hours = "9-17 Mon-Fri"
+work_hours = "9-17 Mon-Fri"         # check-ins only fire inside these; "" = any time
 miss_threshold = 3                  # unanswered check-ins before offering "say pause"
 notifier = "desktop"                # "desktop" (macOS notification) or "terminal"
 archive_after_days = 1              # days done items stay in tasks.md before moving to done.md
+log_keep_days = 30                  # days of log.md to keep; 0 = keep everything
+report_at = "end"                   # end-of-day report: "end" of work hours, "HH:MM", or "off"
+report_lookback_days = 7            # days of log and done items the report covers
+late_checkin_minutes = 5            # skip check-ins that would fire later than this (after sleep)
+recent_turns = 6                    # recent exchanges each turn sees
+recent_log_entries = 10             # recent log entries each turn sees
+# The first message or check-in of each day runs this first; "" turns it off.
+# morning_bootstrap = "Morning: check my open PRs, review requests and ..."
+# Run right before each check-in to tick off finished work and add new work; "" = off.
+# progress_check = "check my PRs and Slack for progress on my current tasks or new tasks"
 
 [llm]
 provider = "claude"
@@ -156,6 +218,10 @@ light_model = "claude-haiku-5-5"
 light_effort = "low"
 strong_model = "claude-opus-5-5"
 strong_effort = "high"
+# What sends a message to the strong model:
+# strong_keywords = ["explain", "why ", "how would", "how do we", "can we", "confused", "do we have enough"]
+# strong_min_chars = 400
+# strong_question_words = 14
 
 # A local model instead (any OpenAI-compatible server with tool calling):
 # provider = "ollama"            # or "lmstudio", or "openai" with base_url set
@@ -169,6 +235,9 @@ strong_effort = "high"
 # provider = "claude-code"
 # command = "/path/to/claude"     # if it isn't on PATH or in ~/.local/bin
 # session_id = "<uuid>"           # resume one session forever; unset = a new session each day
+# claude_code_tools = ["Bash", "Read", "Edit", "Write", "Glob", "Grep", "WebFetch", "WebSearch", "mcp__focus"]
+#                                 # add your MCP servers, e.g. "mcp__slack", for the coach to use them
+# claude_code_user_mcp = true     # load your own Claude Code MCP servers next to the coach's
 
 [sources]
 # github_org = "my-org"
