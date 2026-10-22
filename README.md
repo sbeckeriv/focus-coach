@@ -122,7 +122,7 @@ Give the model at least 32k tokens of context. A morning bootstrap that fetches 
 
 GitHub Actions has two workflows:
 - **`ci.yml`** runs clippy and the tests on every push and pull request.
-- **`app.yml`** builds a universal `Focus Coach.app` on pushes to `main` and on `v*` tags, and uploads it as a workflow artifact. A `v*` tag also attaches the zip to a GitHub release.
+- **`app.yml`** builds `Focus Coach.app` for Apple Silicon on pushes to `main` and on `v*` tags, and uploads it as a workflow artifact. A `v*` tag also attaches the zip to a GitHub release.
 
 The app isn't signed or notarized, so macOS blocks it on first launch. Clear the quarantine flag after unzipping:
 

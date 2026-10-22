@@ -1,0 +1,43 @@
+name: App
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+concurrency:
+  group: app-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: macos-latest
+    permissions:
+      contents: write # attach the zip to a release on v* tags
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install the Tauri CLI
+        run: cargo install tauri-cli --version "^2" --locked
+      # macos-latest is Apple Silicon; the app is built for arm64 only.
+      - name: Build Focus Coach.app
+        working-directory: crates/menubar
+        run: cargo tauri build
+      - name: Zip the app
+        run: |
+          cd "target/release/bundle/macos"
+          ditto -c -k --keepParent "Focus Coach.app" "$GITHUB_WORKSPACE/focus-coach-macos.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: focus-coach-macos
+          path: focus-coach-macos.zip
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: focus-coach-macos.zip
