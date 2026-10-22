@@ -1,0 +1,285 @@
+//! Drives the built `focus` binary: it starts its own background daemon, which talks
+//! to a scripted mock model served from this test process.
+
+#[path = "../../core/tests/support/mod.rs"]
+mod support;
+
+use std::path::{Path, PathBuf};
+
+use serde_json::json;
+use support::{MockLlm, Reply, calls, text, write_config};
+
+struct Home {
+    dir: tempfile::TempDir,
+}
+
+impl Home {
+    fn new(llm: &MockLlm, tasks: &str) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path(), &llm.url);
+        std::fs::write(dir.path().join("tasks.md"), tasks).unwrap();
+        Home { dir }
+    }
+
+    fn path(&self) -> PathBuf {
+        self.dir.path().to_path_buf()
+    }
+
+    async fn focus(&self, args: &[&str]) -> (bool, String, String) {
+        run(self.dir.path(), args).await
+    }
+}
+
+/// Stops the background daemon even when an assertion fails.
+impl Drop for Home {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new(env!("CARGO_BIN_EXE_focus"))
+            .arg("stop")
+            .env("FOCUS_HOME", self.dir.path())
+            .output();
+    }
+}
+
+async fn run(home: &Path, args: &[&str]) -> (bool, String, String) {
+    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_focus"))
+        .args(args)
+        .env("FOCUS_HOME", home)
+        .output()
+        .await
+        .unwrap();
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+#[tokio::test]
+async fn status_and_stop_without_a_daemon_dont_start_one() {
+    let llm = MockLlm::start().await;
+    let home = Home::new(&llm, "");
+    let (ok, out, _) = home.focus(&["status"]).await;
+    assert!(ok);
+    assert!(out.contains("isn't running"), "{out}");
+    let (ok, out, _) = home.focus(&["stop"]).await;
+    assert!(ok && out.contains("isn't running"), "{out}");
+    assert!(!home.path().join("focus.sock").exists());
+}
+
+#[tokio::test]
+async fn commands_start_the_daemon_and_print_turns() {
+    let llm = MockLlm::start().await;
+    let home = Home::new(&llm, "## Today\n- [ ] Cut lodash PRs {id=t1}\n- [ ] Review configs {id=t2}\n");
+
+    let (ok, out, err) = home.focus(&["tasks"]).await;
+    assert!(ok, "{err}");
+    assert!(out.contains("- [ ] Cut lodash PRs {id=t1}"), "{out}");
+
+    llm.script([
+        calls(&[("check_off", json!({"task_id": "t1"})), ("preview", json!({"kind": "commit message", "content": "Bump lodash"}))]),
+        text("Checked off. Next: Review configs (t2)."),
+    ]);
+    let (ok, out, err) = home.focus(&["say", "I", "cut", "PRs", "for", "lodash"]).await;
+    assert!(ok, "{err}");
+    assert!(out.contains("  · done t1: Cut lodash PRs"), "{out}");
+    assert!(out.contains("┌─ commit message (preview, not sent)\n│ Bump lodash\n└─"), "{out}");
+    assert!(out.contains("Checked off. Next: Review configs (t2)."), "{out}");
+    assert!(std::fs::read_to_string(home.path().join("tasks.md")).unwrap().contains("- [x] Cut lodash PRs"));
+    let request = &llm.requests()[0];
+    assert!(support::user_prompt(request).contains("I cut PRs for lodash"), "words are joined into one message");
+
+    let (ok, out, _) = home.focus(&["pause"]).await;
+    assert!(ok && out.contains("paused until your next message"), "{out}");
+    let (_, out, _) = home.focus(&["status"]).await;
+    assert!(out.contains("1 open · top: Review configs (t2) · paused until your next message"), "{out}");
+
+    llm.script([text("Top item: Review configs (t2). First step: open the diff.")]);
+    let (ok, out, _) = home.focus(&["next"]).await;
+    assert!(ok && out.contains("First step"), "{out}");
+    assert!(support::user_prompt(&llm.requests()[2]).contains("what's next?"));
+
+    let (ok, out, _) = home.focus(&["stop"]).await;
+    assert!(ok && out.contains("Daemon stopping"), "{out}");
+    let (_, out, _) = home.focus(&["status"]).await;
+    assert!(out.contains("isn't running"), "{out}");
+}
+
+#[tokio::test]
+async fn failures_exit_nonzero_with_the_error_on_stderr() {
+    let llm = MockLlm::start().await;
+    let home = Home::new(&llm, "");
+
+    let (ok, _, err) = home.focus(&["say"]).await;
+    assert!(!ok);
+    assert!(err.contains("say what?"), "{err}");
+
+    llm.script([Reply::Status(503, "model is loading".into())]);
+    let (ok, _, err) = home.focus(&["say", "hello"]).await;
+    assert!(!ok, "a failed turn must exit nonzero");
+    assert!(err.contains("error:") && err.contains("model is loading"), "{err}");
+}
+
+#[tokio::test]
+async fn report_prints_and_saves() {
+    let llm = MockLlm::start().await;
+    let home = Home::new(&llm, "## Today\n- [x] Shipped {id=t1 done=2026-10-21}\n");
+    llm.script([text("## Done\n- Shipped (t1)")]);
+    let (ok, out, err) = home.focus(&["report"]).await;
+    assert!(ok, "{err}");
+    assert!(out.contains("## Done\n- Shipped (t1)"), "{out}");
+    let saved = out.lines().find_map(|l| l.strip_prefix("Saved to ")).expect("a saved path");
+    assert!(std::fs::read_to_string(saved).unwrap().contains("Shipped (t1)"));
+}
+
+/// Stands in for `claude -p`: records its flags and prompt, then plays Claude Code's
+/// side of MCP against the `focus mcp` server named in --mcp-config.
+const FAKE_CLAUDE: &str = r#"#!/bin/sh
+dir="$(dirname "$0")"
+cfg=""
+sid=""
+printf '%s\0' "CALL" "$@" >> "$dir/claude-args"
+while [ $# -gt 0 ]; do
+  case "$1" in --mcp-config) cfg="$2" ;; --session-id) sid="$2" ;; esac
+  shift
+done
+cat > "$dir/claude-stdin"
+# Like the real CLI, refuse to create a session id that already exists.
+if [ -n "$sid" ] && grep -qx "$sid" "$dir/taken" 2>/dev/null; then
+  echo "Error: Session ID $sid is already in use." >&2
+  exit 1
+fi
+if [ -n "$cfg" ]; then
+  exe=$(printf '%s' "$cfg" | sed -E 's/.*"command":"([^"]*)".*/\1/')
+  turn=$(printf '%s' "$cfg" | sed -E 's/.*"args":\["mcp","([0-9]+)"\].*/\1/')
+  printf '%s\n' \
+    '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}' \
+    '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+    '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
+    '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"check_off","arguments":{"task_id":"t1"}}}' \
+    '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"check_off","arguments":{"task_id":"t99"}}}' \
+    | "$exe" mcp "$turn" > "$dir/mcp-out"
+fi
+echo '{"type":"result","subtype":"success","is_error":false,"result":"Checked off t1."}'
+"#;
+
+/// A FOCUS_HOME whose provider is claude-code, run by FAKE_CLAUDE.
+fn claude_code_home(extra_llm: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = dir.path().join("claude");
+    std::fs::write(&fake, FAKE_CLAUDE).unwrap();
+    std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let config = format!(
+        "schedule = \"0 3 1 1 *\"\nnotifier = \"terminal\"\n\n[llm]\nprovider = \"claude-code\"\ncommand = \"{}\"\nlight_model = \"haiku-test\"\nstrong_model = \"opus-test\"\n{extra_llm}",
+        fake.display()
+    );
+    std::fs::write(dir.path().join("focus.toml"), config).unwrap();
+    std::fs::write(dir.path().join("tasks.md"), "## Today\n- [ ] Cut lodash PRs {id=t1}\n").unwrap();
+    dir
+}
+
+/// The arguments of each `claude` run so far, oldest first.
+fn claude_calls(home: &Path) -> Vec<Vec<String>> {
+    let text = std::fs::read_to_string(home.join("claude-args")).unwrap_or_default();
+    text.split("CALL\0").filter(|c| !c.is_empty()).map(|c| c.split_terminator('\0').map(String::from).collect()).collect()
+}
+
+fn flag<'a>(call: &'a [String], name: &str) -> Option<&'a str> {
+    call.windows(2).find(|w| w[0] == name).map(|w| w[1].as_str())
+}
+
+#[tokio::test]
+async fn claude_code_provider_runs_turns_through_claude_and_focus_mcp() {
+    let dir = claude_code_home("");
+    let home = dir.path();
+    let read = |name: &str| std::fs::read_to_string(home.join(name)).unwrap_or_default();
+
+    let (ok, out, err) = run(home, &["say", "shipped the lodash PRs"]).await;
+    assert!(ok, "{out}{err}");
+    assert!(out.contains("Checked off t1."), "the result text is the reply:\n{out}");
+    assert!(out.contains("· done t1: Cut lodash PRs"), "tool changes stream like any turn:\n{out}");
+    assert!(read("tasks.md").contains("- [x] Cut lodash PRs"), "{}", read("tasks.md"));
+    assert!(read("log.md").contains("- done t1: Cut lodash PRs"), "{}", read("log.md"));
+
+    let calls = claude_calls(home);
+    let args = &calls[0];
+    assert!(args.contains(&"-p".into()) && flag(args, "--output-format") == Some("json"), "{args:?}");
+    assert_eq!(flag(args, "--model"), Some("haiku-test"));
+    assert!(args.contains(&"--strict-mcp-config".into()), "{args:?}");
+    assert!(flag(args, "--allowedTools") == Some("Bash") && args.contains(&"mcp__focus".into()), "all built-ins plus the coach's: {args:?}");
+    assert!(args.iter().any(|a| a.starts_with("You are Focus Coach") && a.contains("mcp__focus__")), "{args:?}");
+    let prompt = read("claude-stdin");
+    assert!(prompt.contains("<input kind=\"message\">") && prompt.contains("shipped the lodash PRs"), "{prompt}");
+    assert!(prompt.contains("Cut lodash PRs {id=t1}"), "the prompt carries the task list:\n{prompt}");
+
+    let replies: Vec<serde_json::Value> = read("mcp-out").lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert_eq!(replies.len(), 4, "one answer per request, none for the notification: {replies:?}");
+    assert_eq!(replies[0]["result"]["serverInfo"]["name"], "focus");
+    let tools = replies[1]["result"]["tools"].as_array().unwrap();
+    assert!(tools.iter().any(|t| t["name"] == "check_off" && t["inputSchema"]["type"] == "object"), "{tools:?}");
+    assert_eq!(replies[2]["result"]["content"][0]["text"], "checked off t1");
+    assert_eq!(replies[2]["result"]["isError"], false);
+    assert_eq!(replies[3]["result"]["isError"], true, "a bad id goes back to the model as a tool error");
+
+    // Plain completions (the report) run with no tools and save no session.
+    let (ok, out, err) = run(home, &["report"]).await;
+    assert!(ok, "{out}{err}");
+    let calls = claude_calls(home);
+    let report = calls.last().unwrap();
+    assert_eq!(flag(report, "--tools"), Some(""), "{report:?}");
+    assert_eq!(flag(report, "--model"), Some("opus-test"));
+    assert!(report.contains(&"--no-session-persistence".into()) && flag(report, "--resume").is_none(), "{report:?}");
+    let _ = run(home, &["stop"]).await;
+}
+
+#[tokio::test]
+async fn claude_code_keeps_one_session_per_day_across_restarts() {
+    let dir = claude_code_home("");
+    let home = dir.path();
+
+    assert!(run(home, &["say", "morning"]).await.0);
+    let first = claude_calls(home);
+    let id = flag(&first[0], "--session-id").expect("the first turn creates the session").to_string();
+    assert!(first[0].iter().all(|a| a != "--no-session-persistence"), "{:?}", first[0]);
+
+    // A restart must not lose the day's session.
+    let _ = run(home, &["stop"]).await;
+    assert!(run(home, &["say", "on the lodash PRs"]).await.0);
+    let calls = claude_calls(home);
+    assert_eq!(flag(&calls[1], "--resume"), Some(id.as_str()), "later turns resume it: {:?}", calls[1]);
+    assert!(flag(&calls[1], "--session-id").is_none());
+
+    let (_, out, _) = run(home, &["status"]).await;
+    assert!(out.contains(&format!("claude --resume {id}")), "{out}");
+
+    // Another day gets a new session.
+    let state = std::fs::read_to_string(home.join("state.json")).unwrap();
+    let mut state: serde_json::Value = serde_json::from_str(&state).unwrap();
+    state["session"]["date"] = json!("2020-01-01");
+    let _ = run(home, &["stop"]).await;
+    std::fs::write(home.join("state.json"), state.to_string()).unwrap();
+    assert!(run(home, &["say", "new day"]).await.0);
+    let calls = claude_calls(home);
+    let next = flag(&calls[2], "--session-id").expect("a new day creates a new session");
+    assert_ne!(next, id);
+    let _ = run(home, &["stop"]).await;
+}
+
+#[tokio::test]
+async fn a_configured_session_id_is_resumed_even_when_we_didnt_create_it() {
+    let id = "8d3f6a2e-5b1c-4f7e-9a0d-2c4b6e8f1a3d";
+    let dir = claude_code_home(&format!("session_id = \"{id}\"\n"));
+    let home = dir.path();
+    // The session already exists in Claude Code, so creating it fails.
+    std::fs::write(home.join("taken"), format!("{id}\n")).unwrap();
+
+    let (ok, out, err) = run(home, &["say", "morning"]).await;
+    assert!(ok, "{out}{err}");
+    let calls = claude_calls(home);
+    assert_eq!(flag(&calls[0], "--session-id"), Some(id), "{calls:?}");
+    assert_eq!(flag(&calls[1], "--resume"), Some(id), "falls back to resuming it: {calls:?}");
+
+    assert!(run(home, &["say", "next"]).await.0);
+    assert_eq!(claude_calls(home).len(), 3, "and resumes directly from then on");
+    assert_eq!(flag(&claude_calls(home)[2], "--resume"), Some(id));
+    let _ = run(home, &["stop"]).await;
+}

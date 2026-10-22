@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Focus Coach</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <div class="title">
+      <strong>Focus Coach</strong>
+      <span id="status" class="muted">connecting…</span>
+    </div>
+    <div class="actions">
+      <button id="next" title="What's next?">Next</button>
+      <button id="toggle" title="Pause or resume check-ins">Pause</button>
+      <button id="report" title="Pause and write the end-of-day report">Report</button>
+    </div>
+  </header>
+
+  <section id="tasks" aria-label="Tasks"></section>
+
+  <main id="feed" aria-live="polite"></main>
+
+  <form id="composer">
+    <textarea id="input" rows="1" placeholder="What are you on? Paste a link, ask anything…" autofocus></textarea>
+    <button type="submit">Send</button>
+  </form>
+
+  <script src="app.js"></script>
+</body>
+</html>

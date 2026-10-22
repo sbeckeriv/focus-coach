@@ -1,0 +1,20 @@
+[package]
+name = "focus"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "focus"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+tokio.workspace = true
+focus-core.workspace = true
+clap = { version = "4", features = ["derive"] }
+ratatui = "0.30"
+
+[dev-dependencies]
+tempfile = "3"
+serde_json.workspace = true

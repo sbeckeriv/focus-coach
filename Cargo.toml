@@ -1,0 +1,15 @@
+[workspace]
+resolver = "3"
+members = ["crates/core", "crates/focus", "crates/menubar"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+focus-core = { path = "crates/core" }
