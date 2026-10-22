@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
-use chrono::{Duration, Local};
+use chrono::{Duration, Local, NaiveDate};
 use serde_json::json;
 
 use crate::daemon::App;
@@ -13,7 +13,7 @@ use crate::provider::Tier;
 const REPORT_PROMPT: &str = r#"You write the end-of-day report for a person's task list. Use markdown with exactly these sections:
 
 ## Done
-Grouped by day, most recent first. Use each item's done= date and the log.
+Grouped by day, most recent first. Use done= dates from the task list and the done archive, and the log.
 ## Next
 Open items in the order they should be worked, with one concrete first step for the top item.
 ## On hold
@@ -28,11 +28,15 @@ pub(crate) async fn generate(app: &App) -> Result<(String, PathBuf)> {
     let today = Local::now().date_naive();
     let list = app.store.load()?;
     let log = app.log.since(today - Duration::days(7));
+    // Finished items move to done.md, one section per day; bring back the last week of them.
+    let mut done = app.store.load_done()?;
+    let since = today - Duration::days(7);
+    done.sections.retain(|s| s.name.parse::<NaiveDate>().is_ok_and(|d| d >= since));
     let prompt = format!(
-        "Today is {}.\n\n<task_list>\n{}</task_list>\n\n<log since=\"{}\">\n{}\n</log>",
+        "Today is {}.\n\n<task_list>\n{}</task_list>\n\n<done_archive since=\"{since}\">\n{}</done_archive>\n\n<log since=\"{since}\">\n{}\n</log>",
         today.format("%a %Y-%m-%d"),
         list.render(),
-        today - Duration::days(7),
+        done.render(),
         log.join("\n\n"),
     );
     let messages = [json!({"role": "user", "content": prompt})];

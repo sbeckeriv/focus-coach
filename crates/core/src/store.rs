@@ -115,11 +115,19 @@ impl Section {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TaskList {
     pub sections: Vec<Section>,
+    /// The highest id already used elsewhere (done.md), so new ids never repeat one.
+    #[serde(skip)]
+    pub id_floor: u32,
 }
 
 impl TaskList {
     pub fn parse(text: &str) -> Self {
-        let mut list = TaskList::default();
+        Self::parse_above(text, 0)
+    }
+
+    /// Parses, numbering items written without an id above `id_floor`.
+    pub fn parse_above(text: &str, id_floor: u32) -> Self {
+        let mut list = TaskList { id_floor, ..Default::default() };
         for line in text.lines() {
             let trimmed = line.trim();
             if let Some(name) = line.strip_prefix("## ") {
@@ -178,6 +186,7 @@ impl TaskList {
             .filter_map(|(_, t)| t.id.strip_prefix('t')?.parse().ok())
             .max()
             .unwrap_or(0)
+            .max(self.id_floor)
     }
 
     pub fn next_id(&self) -> String {
@@ -189,11 +198,14 @@ impl TaskList {
     }
 
     pub fn render(&self) -> String {
-        let mut out = String::from("# Focus tasks\n\n");
-        out.push_str(
-            "<!-- Edit freely. [ ] open, [x] done, [-] on hold, [!] blocked. \
+        self.render_as(
+            "# Focus tasks\n\n<!-- Edit freely. [ ] open, [x] done, [-] on hold, [!] blocked. \
              Keep {id=..} so the coach can find items; new items get one on save. -->\n",
-        );
+        )
+    }
+
+    fn render_as(&self, head: &str) -> String {
+        let mut out = head.to_string();
         for section in &self.sections {
             out.push_str(&format!("\n## {}\n", section.name));
             if section.on_hold {
@@ -284,6 +296,30 @@ impl TaskList {
 
     /// The single item a check-in should name: open, not in a held section,
     /// lowest priority number first, then list order.
+    /// Removes done tasks finished on or before `cutoff`, with the section each was in.
+    /// Done items with no date get `today`, so they leave on schedule too. Sections
+    /// that only held archived items go with them.
+    pub fn take_done(&mut self, cutoff: NaiveDate, today: NaiveDate) -> Vec<(String, Task)> {
+        let mut taken = Vec::new();
+        for section in &mut self.sections {
+            let (gone, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut section.tasks).into_iter().partition(|t| {
+                t.state == State::Done && t.done_on.unwrap_or(today) <= cutoff
+            });
+            section.tasks = keep;
+            for task in &mut section.tasks {
+                if task.state == State::Done && task.done_on.is_none() {
+                    task.done_on = Some(today);
+                }
+            }
+            taken.extend(gone.into_iter().map(|t| (section.name.clone(), t)));
+        }
+        let emptied: Vec<&String> = taken.iter().map(|(s, _)| s).collect();
+        self.sections.retain(|s| {
+            !(emptied.contains(&&s.name) && s.tasks.is_empty() && s.extra.is_empty() && !s.on_hold)
+        });
+        taken
+    }
+
     pub fn top_open(&self) -> Option<&Task> {
         self.sections
             .iter()
@@ -377,29 +413,94 @@ fn render_task(out: &mut String, task: &Task) {
     }
 }
 
+const DONE_HEAD: &str = "# Done\n\n<!-- Finished tasks moved out of tasks.md, newest day first. -->\n";
+
+fn read_list(path: &Path, id_floor: u32) -> Result<TaskList> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(TaskList::parse_above(&text, id_floor)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(TaskList { id_floor, ..Default::default() }),
+        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+fn write_atomic(path: &Path, text: &str) -> Result<()> {
+    let tmp = path.with_extension("md.tmp");
+    std::fs::write(&tmp, text)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct Store {
     path: PathBuf,
+    /// done.md, where finished tasks go; one section per day.
+    archive: Option<PathBuf>,
 }
 
 impl Store {
     pub fn new(path: &Path) -> Self {
-        Self { path: path.to_path_buf() }
+        Self { path: path.to_path_buf(), archive: None }
+    }
+
+    pub fn with_archive(mut self, path: &Path) -> Self {
+        self.archive = Some(path.to_path_buf());
+        self
     }
 
     pub fn load(&self) -> Result<TaskList> {
-        match std::fs::read_to_string(&self.path) {
-            Ok(text) => Ok(TaskList::parse(&text)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(TaskList::default()),
-            Err(e) => Err(e).with_context(|| format!("reading {}", self.path.display())),
-        }
+        let floor = match &self.archive {
+            Some(path) => read_list(path, 0)?.max_id(),
+            None => 0,
+        };
+        read_list(&self.path, floor)
     }
 
     pub fn save(&self, list: &TaskList) -> Result<()> {
-        let tmp = self.path.with_extension("md.tmp");
-        std::fs::write(&tmp, list.render())?;
-        std::fs::rename(&tmp, &self.path)?;
-        Ok(())
+        write_atomic(&self.path, &list.render())
+    }
+
+    /// The archive: one section per day, named YYYY-MM-DD, newest first.
+    pub fn load_done(&self) -> Result<TaskList> {
+        match &self.archive {
+            Some(path) => read_list(path, 0),
+            None => Ok(TaskList::default()),
+        }
+    }
+
+    /// Moves tasks done `after_days` or more days ago to done.md. Returns how many moved.
+    pub fn archive_done(&self, today: NaiveDate, after_days: u32) -> Result<usize> {
+        let Some(archive) = &self.archive else { return Ok(0) };
+        let cutoff = today - chrono::Days::new(after_days.into());
+        let mut list = self.load()?;
+        let before = list.render();
+        let mut taken = list.take_done(cutoff, today);
+        if taken.is_empty() {
+            // Only rewrite tasks.md when a hand-checked item just got its done date.
+            if list.render() != before {
+                self.save(&list)?;
+            }
+            return Ok(0);
+        }
+        taken.sort_by_key(|(_, t)| t.done_on);
+        let mut done = read_list(archive, 0)?;
+        let count = taken.len();
+        for (from, mut task) in taken {
+            task.extra.push(format!("  - from: {from}"));
+            let day = task.done_on.unwrap_or(today).to_string();
+            match done.sections.iter_mut().find(|s| s.name == day) {
+                Some(section) => section.tasks.push(task),
+                None => {
+                    let mut section = Section::new(day);
+                    section.tasks.push(task);
+                    done.sections.push(section);
+                }
+            }
+        }
+        done.sections.sort_by(|a, b| b.name.cmp(&a.name));
+        // Written before tasks.md: a failure in between duplicates an item, never loses one.
+        write_atomic(archive, &done.render_as(DONE_HEAD))?;
+        self.save(&list)?;
+        Ok(count)
     }
 
     /// Re-reads the file, applies `f`, and writes it back.
@@ -414,6 +515,61 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn day(d: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(2026, 10, d).unwrap()
+    }
+
+    #[test]
+    fn archive_moves_old_done_items_to_done_md_by_day() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tasks, done) = (dir.path().join("tasks.md"), dir.path().join("done.md"));
+        std::fs::write(
+            &tasks,
+            "## Today\n- [x] Old {id=t1 done=2026-10-20}\n  - link: https://x.y/1\n- [x] Today {id=t2 done=2026-10-22}\n- [ ] Open {id=t3}\n\n## Gone\n- [x] Older {id=t4 done=2026-10-19}\n\n## Kept\nSome prose.\n- [x] Hand checked\n",
+        )
+        .unwrap();
+        let store = Store::new(&tasks).with_archive(&done);
+
+        assert_eq!(store.archive_done(day(22), 1).unwrap(), 2);
+        let list = store.load().unwrap();
+        let ids: Vec<_> = list.tasks().map(|(_, t)| t.id.as_str()).collect();
+        assert_eq!(ids, ["t2", "t3", "t5"], "today's done items stay");
+        assert!(list.sections.iter().all(|s| s.name != "Gone"), "a section emptied by archiving goes");
+        assert_eq!(list.get("t5").unwrap().done_on, Some(day(22)), "hand-checked items get today as their date");
+
+        let text = std::fs::read_to_string(&done).unwrap();
+        let newest = text.find("## 2026-10-20").unwrap();
+        assert!(newest < text.find("## 2026-10-19").unwrap(), "newest day first:\n{text}");
+        assert!(text.contains("- [x] Old {id=t1 done=2026-10-20}\n  - link: https://x.y/1\n  - from: Today"), "{text}");
+        assert!(text.contains("- [x] Older {id=t4 done=2026-10-19}\n  - from: Gone"), "{text}");
+
+        // Archived ids are never handed out again.
+        std::fs::write(&tasks, "## Today\n- [ ] new by hand\n").unwrap();
+        let list = store.load().unwrap();
+        assert_eq!(list.tasks().next().unwrap().1.id, "t5");
+        assert_eq!(list.next_id(), "t6");
+
+        // Nothing due: tasks.md is left alone.
+        let before = std::fs::read_to_string(&tasks).unwrap();
+        assert_eq!(store.archive_done(day(22), 1).unwrap(), 0);
+        assert_eq!(std::fs::read_to_string(&tasks).unwrap(), before);
+    }
+
+    #[test]
+    fn archive_after_zero_days_moves_items_right_away() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tasks, done) = (dir.path().join("tasks.md"), dir.path().join("done.md"));
+        std::fs::write(&tasks, "## Today\n- [x] Just now {id=t1 done=2026-10-22}\n- [x] Later {id=t2 done=2026-10-21}\n").unwrap();
+        let store = Store::new(&tasks).with_archive(&done);
+        assert_eq!(store.archive_done(day(22), 0).unwrap(), 2);
+        assert_eq!(store.load().unwrap().tasks().count(), 0);
+        let more = Store::new(&tasks).with_archive(&done);
+        std::fs::write(&tasks, "## Today\n- [x] Again {id=t3 done=2026-10-22}\n").unwrap();
+        more.archive_done(day(22), 0).unwrap();
+        let text = std::fs::read_to_string(&done).unwrap();
+        assert_eq!(text.matches("## 2026-10-22").count(), 1, "same day, same section:\n{text}");
+    }
 
     const SAMPLE: &str = "# Focus tasks\n\n## Release\n> on hold: design\n\nSome prose.\n\n- [ ] Merge lodash {id=t3 p=1 due=2026-10-30}\n  - link: https://example.com/pr/1\n  - note: second reviewer\n  random indented line\n- [x] PRs cut {id=t2 done=2026-10-21}\n\n## Today\n- [ ] written by hand\n- [!] stuck {id=t9}\n";
 

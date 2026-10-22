@@ -29,6 +29,10 @@ impl Paths {
     pub fn tasks(&self) -> PathBuf {
         self.home.join("tasks.md")
     }
+    /// Finished tasks, moved out of tasks.md after `archive_after_days`.
+    pub fn done(&self) -> PathBuf {
+        self.home.join("done.md")
+    }
     pub fn log(&self) -> PathBuf {
         self.home.join("log.md")
     }
@@ -63,6 +67,8 @@ pub struct Settings {
     pub work_hours: Option<String>,
     pub miss_threshold: u32,
     pub notifier: Notifier,
+    /// Days a done item stays on the list before moving to done.md; 0 moves it right away.
+    pub archive_after_days: u32,
     pub llm: LlmSettings,
     pub sources: Sources,
 }
@@ -74,6 +80,7 @@ impl Default for Settings {
             work_hours: Some("9-17 Mon-Fri".into()),
             miss_threshold: 3,
             notifier: Notifier::Desktop,
+            archive_after_days: 1,
             llm: LlmSettings::default(),
             sources: Sources::default(),
         }
@@ -141,6 +148,7 @@ schedule = "7,27,47 9-17 * * 1-5"   # minute hour day-of-month month day-of-week
 work_hours = "9-17 Mon-Fri"
 miss_threshold = 3                  # unanswered check-ins before offering "say pause"
 notifier = "desktop"                # "desktop" (macOS notification) or "terminal"
+archive_after_days = 1              # days done items stay in tasks.md before moving to done.md
 
 [llm]
 provider = "claude"

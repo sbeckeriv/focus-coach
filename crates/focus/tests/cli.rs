@@ -73,6 +73,9 @@ async fn commands_start_the_daemon_and_print_turns() {
 
     let (ok, out, err) = home.focus(&["tasks"]).await;
     assert!(ok, "{err}");
+    assert!(out.contains("▶ Cut lodash PRs  t1") && out.contains("2 open · 0 done today"), "{out}");
+    assert!(!out.contains('\x1b'), "no color when piped:\n{out}");
+    let (_, out, _) = home.focus(&["tasks", "--markdown"]).await;
     assert!(out.contains("- [ ] Cut lodash PRs {id=t1}"), "{out}");
 
     llm.script([

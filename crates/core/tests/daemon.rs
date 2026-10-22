@@ -319,6 +319,27 @@ async fn set_schedule_validates_and_replaces_the_one_schedule() {
 }
 
 #[tokio::test]
+async fn yesterdays_done_items_move_to_done_md_and_reach_the_report() {
+    let yesterday = Local::now().date_naive() - chrono::Days::new(1);
+    let h = start(&format!("## Today\n- [x] Shipped {{id=t1 done={yesterday}}}\n- [ ] Still open {{id=t2}}\n")).await;
+
+    let list = h.tasks().await;
+    assert_eq!(list.tasks().map(|(_, t)| t.id.as_str()).collect::<Vec<_>>(), ["t2"]);
+    assert!(h.file("done.md").contains(&format!("## {yesterday}\n\n- [x] Shipped {{id=t1 done={yesterday}}}")), "{}", h.file("done.md"));
+    assert!(h.file("log.md").contains("moved 1 done item to done.md"), "{}", h.file("log.md"));
+
+    // A toggle right after doesn't archive today's item (the default keeps it a day).
+    h.send(Request::Toggle { id: "t2".into() }).await;
+    assert!(h.file("tasks.md").contains("- [x] Still open"));
+
+    h.llm.script([text("## Done\n- t1")]);
+    h.send(Request::Report).await;
+    let prompt = user_prompt(&h.llm.requests()[0]);
+    assert!(prompt.contains("<done_archive") && prompt.contains("Shipped {id=t1"), "{prompt}");
+    h.stop().await;
+}
+
+#[tokio::test]
 async fn report_pauses_writes_the_file_and_uses_the_strong_model() {
     let h = start(TASKS).await;
     h.llm.script([text("## Done\n- t1\n## Next\n- t2\n## On hold\nNone\n## Stale\nNone")]);

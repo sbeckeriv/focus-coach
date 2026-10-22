@@ -1,5 +1,7 @@
+mod list;
 mod tui;
 
+use std::io::IsTerminal;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -37,7 +39,11 @@ enum Command {
     /// Show the check-in state.
     Status,
     /// Print the task list.
-    Tasks,
+    Tasks {
+        /// Print tasks.md as stored, with every field.
+        #[arg(long)]
+        markdown: bool,
+    },
     /// Open the terminal UI (the default with no command).
     Tui,
     /// Run the daemon in the foreground.
@@ -54,6 +60,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let paths = Paths::from_env()?;
     let command = cli.command.unwrap_or(Command::Tui);
+    let mut raw_tasks = false;
 
     let request = match command {
         Command::Daemon => return daemon::run(paths).await,
@@ -77,14 +84,23 @@ async fn main() -> Result<()> {
             None => bail!("say what? e.g. focus say \"on the lodash PRs\""),
         },
         Command::Status => Request::Status,
-        Command::Tasks => Request::Tasks,
+        Command::Tasks { markdown } => {
+            raw_tasks = markdown;
+            Request::Tasks
+        }
         Command::Stop => Request::Shutdown,
     };
     ensure_daemon(&paths).await?;
     let mut failed = false;
     client::request(&paths, request, |event| {
         failed |= matches!(event, Event::Error { .. });
-        print_event(&event);
+        match &event {
+            Event::Tasks { list } if !raw_tasks => {
+                let color = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+                print!("{}", list::format(list, chrono::Local::now().date_naive(), color));
+            }
+            _ => print_event(&event),
+        }
     })
     .await?;
     if failed {

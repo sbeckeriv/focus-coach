@@ -91,7 +91,7 @@ impl App {
             ..Default::default()
         };
         Ok(Self {
-            store: Store::new(&paths.tasks()),
+            store: Store::new(&paths.tasks()).with_archive(&paths.done()),
             log: Log::new(&paths.log()),
             paths,
             settings,
@@ -202,6 +202,7 @@ impl App {
 
     async fn handle_input(self: Arc<Self>, turn: u64, text: String, kind: InputKind) {
         let _guard = self.turn_lock.lock().await;
+        self.archive_done();
         let (was_reply, unpaused) = {
             let mut rt = self.rt();
             let was_reply = rt.awaiting_reply;
@@ -227,6 +228,8 @@ impl App {
             }),
             _ => interpreter::run(&self, turn, &text, kind, was_reply).await,
         };
+        // With archive_after_days = 0, what the turn just checked off goes now.
+        self.archive_done();
         match result {
             Ok(reply) => {
                 if !reply.trim().is_empty() {
@@ -282,6 +285,7 @@ impl App {
     }
 
     async fn checkin(&self) {
+        self.archive_done();
         let text = {
             let mut rt = self.rt();
             if rt.paused {
@@ -326,6 +330,19 @@ impl App {
         write_event(out, &Event::Done).await
     }
 
+    /// Moves done items past `archive_after_days` to done.md. Failing here never blocks a turn.
+    fn archive_done(&self) {
+        match self.store.archive_done(Local::now().date_naive(), self.settings.archive_after_days) {
+            Ok(0) => {}
+            Ok(n) => {
+                let mut entry = LogEntry::new("archive", "");
+                entry.changes.push(format!("moved {n} done item{} to done.md", if n == 1 { "" } else { "s" }));
+                let _ = self.log.append(&entry);
+            }
+            Err(e) => eprintln!("archiving done items: {e:#}"),
+        }
+    }
+
     /// Flips a task between done and open, straight from a checkbox click.
     fn toggle(&self, id: &str) -> Result<String> {
         let today = Local::now().date_naive();
@@ -343,6 +360,7 @@ impl App {
         entry.changes.push(summary.clone());
         self.log.append(&entry)?;
         self.emit(Event::Changed { turn: 0, summary: summary.clone() });
+        self.archive_done();
         self.emit_status();
         Ok(summary)
     }
@@ -375,6 +393,7 @@ impl App {
                 write_event(&mut out, &Event::Done).await
             }
             Request::Tasks => {
+                self.archive_done();
                 write_event(&mut out, &Event::Tasks { list: self.store.load()? }).await?;
                 write_event(&mut out, &Event::Done).await
             }
@@ -480,6 +499,7 @@ pub async fn run(paths: Paths) -> Result<()> {
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
 
     let app = Arc::new(App::new(paths)?);
+    app.archive_done();
     tokio::spawn(app.clone().scheduler());
     loop {
         tokio::select! {
