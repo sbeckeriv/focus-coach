@@ -1,7 +1,11 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use chrono::NaiveTime;
 use serde::Deserialize;
+
+use crate::hours::WorkHours;
+use crate::schedule::Cron;
 
 /// Where everything lives. `FOCUS_HOME` overrides the default `~/.focus`.
 #[derive(Debug, Clone)]
@@ -62,10 +66,11 @@ impl Paths {
 #[serde(default)]
 pub struct Settings {
     /// Cron expression: minute hour day-of-month month day-of-week.
-    pub schedule: String,
+    pub schedule: Cron,
     /// e.g. "9-17 Mon-Fri" or "9:30-17:30 Mon,Tue,Thu". Check-ins only fire inside these
-    /// hours, and the end-of-day report runs at the end. Empty means any time.
-    pub work_hours: String,
+    /// hours, and the end-of-day report runs at the end. "" (None) means any time.
+    #[serde(deserialize_with = "crate::hours::deserialize")]
+    pub work_hours: Option<WorkHours>,
     pub miss_threshold: u32,
     pub notifier: Notifier,
     /// Days a done item stays on the list before moving to done.md; 0 moves it right away.
@@ -73,7 +78,7 @@ pub struct Settings {
     /// Days of log.md to keep; older entries are deleted. 0 keeps everything.
     pub log_keep_days: u32,
     /// When the end-of-day report runs on work days: "end" (end of work hours), "HH:MM", or "off".
-    pub report_at: String,
+    pub report_at: ReportAt,
     /// Days of log and done items the report covers.
     pub report_lookback_days: u32,
     /// Run at the first message or check-in of each day, before anything else. Empty turns it off.
@@ -93,13 +98,13 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            schedule: "7,27,47 9-17 * * 1-5".into(),
-            work_hours: "9-17 Mon-Fri".into(),
+            schedule: Cron::parse("7,27,47 9-17 * * 1-5").expect("the default schedule parses"),
+            work_hours: WorkHours::parse("9-17 Mon-Fri").expect("the default work hours parse"),
             miss_threshold: 3,
             notifier: Notifier::Desktop,
             archive_after_days: 1,
             log_keep_days: 30,
-            report_at: "end".into(),
+            report_at: ReportAt::End,
             report_lookback_days: 7,
             morning_bootstrap: DEFAULT_BOOTSTRAP.into(),
             progress_check: String::new(),
@@ -119,12 +124,85 @@ pub enum Notifier {
     Desktop,
 }
 
+/// When the automatic end-of-day report runs. Written as "end", "off" or "HH:MM".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "String")]
+pub enum ReportAt {
+    /// At the end of work hours (17:00 when there are none).
+    End,
+    Off,
+    At(NaiveTime),
+}
+
+impl TryFrom<String> for ReportAt {
+    type Error = String;
+    fn try_from(text: String) -> Result<Self, String> {
+        match text.trim() {
+            "end" => Ok(ReportAt::End),
+            "off" | "" => Ok(ReportAt::Off),
+            t => NaiveTime::parse_from_str(t, "%H:%M")
+                .map(ReportAt::At)
+                .map_err(|_| format!("report_at {t:?}: use \"end\", \"off\" or a time like \"17:30\"")),
+        }
+    }
+}
+
+/// Which backend runs the model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub enum ProviderKind {
+    /// The Claude API.
+    #[serde(rename = "claude")]
+    Claude,
+    /// The Claude Code CLI (`claude -p`) on the person's Claude Code login.
+    #[serde(rename = "claude-code", alias = "claude_code")]
+    ClaudeCode,
+    #[serde(rename = "ollama")]
+    Ollama,
+    #[serde(rename = "lmstudio")]
+    LmStudio,
+    /// Any other OpenAI-compatible server, at `base_url`.
+    #[serde(rename = "openai", alias = "local", alias = "llamacpp")]
+    OpenAi,
+}
+
+/// How hard the model thinks: `output_config.effort` for the API, `--effort` for Claude Code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Effort {
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+impl Effort {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Effort::Low => "low",
+            Effort::Medium => "medium",
+            Effort::High => "high",
+            Effort::Xhigh => "xhigh",
+            Effort::Max => "max",
+        }
+    }
+}
+
+/// An effort setting, where "" means none (the model's default).
+fn effort<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Effort>, D::Error> {
+    let text = String::deserialize(d)?;
+    if text.trim().is_empty() {
+        return Ok(None);
+    }
+    Effort::deserialize(serde::de::value::StrDeserializer::new(text.trim())).map(Some)
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct LlmSettings {
     /// "claude" (the API), "claude-code" (shells out to `claude -p`), or "ollama" /
     /// "lmstudio" / "openai" for any OpenAI-compatible server.
-    pub provider: String,
+    pub provider: ProviderKind,
     /// Defaults per provider: api.anthropic.com, localhost:11434/v1, localhost:1234/v1.
     pub base_url: Option<String>,
     /// Environment variable holding a bearer token for OpenAI-compatible servers, if any.
@@ -136,10 +214,12 @@ pub struct LlmSettings {
     pub session_id: Option<String>,
     /// Check-ins and short replies.
     pub light_model: String,
-    pub light_effort: String,
+    #[serde(deserialize_with = "effort")]
+    pub light_effort: Option<Effort>,
     /// Building the list, long docs, design questions, reports.
     pub strong_model: String,
-    pub strong_effort: String,
+    #[serde(deserialize_with = "effort")]
+    pub strong_effort: Option<Effort>,
     /// Words that send a message to the strong model.
     pub strong_keywords: Vec<String>,
     /// Messages at least this long go to the strong model.
@@ -157,15 +237,15 @@ pub struct LlmSettings {
 impl Default for LlmSettings {
     fn default() -> Self {
         Self {
-            provider: "claude".into(),
+            provider: ProviderKind::Claude,
             base_url: None,
             api_key_env: None,
             command: None,
             session_id: None,
             light_model: "claude-haiku-5-5".into(),
-            light_effort: "low".into(),
+            light_effort: Some(Effort::Low),
             strong_model: "claude-opus-5-5".into(),
-            strong_effort: "high".into(),
+            strong_effort: Some(Effort::High),
             strong_keywords: [
                 "explain", "why ", "how would", "how do we", "can we", "confused", "do we have enough",
             ]
@@ -264,5 +344,45 @@ impl Settings {
             settings.sources.repos_root = Some(home.join(rest));
         }
         Ok(settings)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(toml: &str) -> std::result::Result<Settings, String> {
+        toml::from_str(toml).map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn typed_settings_read_from_plain_text() {
+        let s = parse(
+            "schedule = \"*/20 9-17 * * 1-5\"\nwork_hours = \"9:30-17:30 Mon,Wed\"\nreport_at = \"17:15\"\n[llm]\nprovider = \"claude_code\"\nlight_effort = \"\"\nstrong_effort = \"max\"\n",
+        )
+        .unwrap();
+        assert_eq!(s.schedule.as_str(), "*/20 9-17 * * 1-5");
+        assert_eq!(s.work_hours.unwrap().to_string(), "9:30-17:30 Mon,Wed");
+        assert_eq!(s.report_at, ReportAt::At(NaiveTime::from_hms_opt(17, 15, 0).unwrap()));
+        assert_eq!(s.llm.provider, ProviderKind::ClaudeCode, "the old spelling still works");
+        assert_eq!((s.llm.light_effort, s.llm.strong_effort), (None, Some(Effort::Max)));
+
+        let s = parse("work_hours = \"\"\nreport_at = \"off\"\n").unwrap();
+        assert_eq!((s.work_hours, s.report_at), (None, ReportAt::Off));
+        assert_eq!(parse("").unwrap().llm.provider, ProviderKind::Claude);
+    }
+
+    #[test]
+    fn mistakes_fail_when_the_config_loads() {
+        for (toml, says) in [
+            ("report_at = \"5pm\"", "report_at \"5pm\""),
+            ("schedule = \"every 20 minutes\"", "cron needs 5 fields"),
+            ("work_hours = \"nine to five\"", "expected e.g. \"9-17 Mon-Fri\""),
+            ("[llm]\nprovider = \"gpt\"", "unknown variant `gpt`"),
+            ("[llm]\nlight_effort = \"extreme\"", "unknown variant `extreme`"),
+        ] {
+            let err = parse(toml).unwrap_err();
+            assert!(err.contains(says), "{toml}: {err}");
+        }
     }
 }

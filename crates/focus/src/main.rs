@@ -40,10 +40,15 @@ enum Command {
         #[arg(long, short)]
         due: Option<String>,
     },
+    /// Add a note to a task for context: focus note t3 "waiting on legal".
+    Note {
+        id: focus_core::TaskId,
+        text: Vec<String>,
+    },
     /// Approve an outgoing action the coach proposed; it then carries it out.
-    Approve { id: String },
+    Approve { id: focus_core::ActionId },
     /// Drop a proposed action without sending anything.
-    Reject { id: String },
+    Reject { id: focus_core::ActionId },
     /// The next item, with a first step.
     Next,
     /// Pause and write the end-of-day report.
@@ -70,7 +75,7 @@ enum Command {
     Autostart { state: Option<String> },
     /// Serve the coach's tools over MCP to a claude-code turn (started by the daemon).
     #[command(hide = true)]
-    Mcp { turn: u64 },
+    Mcp { turn: focus_core::TurnId },
 }
 
 #[tokio::main]
@@ -96,6 +101,10 @@ async fn main() -> Result<()> {
         Command::Pause => Request::Pause,
         Command::Resume => Request::Resume,
         Command::Add { text, section, due } => add_request(text, section, due)?,
+        Command::Note { id, text } => match joined(text) {
+            Some(text) => Request::Note { id, text },
+            None => bail!("note what? e.g. focus note t3 \"waiting on legal\""),
+        },
         Command::Approve { id } => Request::Approve { id },
         Command::Reject { id } => Request::Reject { id },
         Command::Next => Request::Next,
@@ -136,12 +145,7 @@ fn add_request(words: Vec<String>, section: Option<String>, due: Option<String>)
     let Some(text) = joined(words) else {
         bail!("add what? e.g. focus add \"renew passport\" --due fri, or focus add <url>")
     };
-    let is_link = !text.contains(char::is_whitespace) && (text.starts_with("http://") || text.starts_with("https://"));
-    Ok(if is_link && section.is_none() && due.is_none() {
-        Request::Add { url: text }
-    } else {
-        Request::New { title: text, section, due }
-    })
+    Ok(Request::add(&text, section, due))
 }
 
 fn joined(words: Vec<String>) -> Option<String> {
@@ -187,7 +191,7 @@ fn print_event(event: &Event) {
             println!("└─");
         }
         Event::Proposal { proposal: p, .. } => {
-            println!("┌─ {} {} to {} (awaiting approval)", p.id, p.kind, p.target);
+            println!("┌─ {} (awaiting approval)", p.headline());
             for line in p.content.lines() {
                 println!("│ {line}");
             }
@@ -199,7 +203,7 @@ fn print_event(event: &Event) {
         Event::Status { status } => {
             println!("{}", status.summary());
             for p in &status.pending {
-                println!("awaiting approval: {} {} to {} (focus approve {})", p.id, p.kind, p.target, p.id);
+                println!("awaiting approval: {} (focus approve {})", p.headline(), p.id);
             }
             if let Some(id) = &status.session {
                 println!("Claude Code session {id} (open it with: claude --resume {id})");

@@ -9,7 +9,7 @@ use serde_json::json;
 use crate::daemon::App;
 use crate::log::LogEntry;
 use crate::config::LlmSettings;
-use crate::protocol::Proposal;
+use crate::protocol::{Proposal, TurnId};
 use crate::provider::{Provider, Tier};
 use crate::tools;
 
@@ -40,7 +40,7 @@ impl InputKind {
 
 /// Per-turn bookkeeping the tools write into.
 pub(crate) struct TurnCtx {
-    pub turn: u64,
+    pub turn: TurnId,
     pub changes: Vec<String>,
     pub summary: Option<String>,
     /// Set in an approved turn: the one outgoing action it may carry out.
@@ -110,15 +110,15 @@ fn context_block(app: &App, kind: InputKind, was_reply: bool, approved: Option<&
             out.push_str("Check-ins: paused until the person's next message.\n");
         } else {
             let next = rt.next_checkin.map(|t| t.format("%a %H:%M").to_string()).unwrap_or("none".into());
-            out.push_str(&format!("Check-ins: active, schedule `{}`, next {next}.\n", rt.schedule));
+            out.push_str(&format!("Check-ins: active, schedule `{}`, next {next}.\n", rt.schedule.as_ref().unwrap_or(&app.settings.schedule)));
         }
-        if !app.settings.work_hours.trim().is_empty() {
-            out.push_str(&format!("Work hours: {} (check-ins only fire inside them).\n", app.settings.work_hours));
+        if let Some(hours) = &app.settings.work_hours {
+            out.push_str(&format!("Work hours: {hours} (check-ins only fire inside them).\n"));
         }
         if !rt.pending.is_empty() {
             out.push_str("\n<awaiting_approval>\n");
             for p in &rt.pending {
-                out.push_str(&format!("{}: {} to {}\n{}\n\n", p.id, p.kind, p.target, p.content));
+                out.push_str(&format!("{}\n{}\n\n", p.headline(), p.content));
             }
             out.push_str("</awaiting_approval>\n");
         }
@@ -178,16 +178,45 @@ fn context_block(app: &App, kind: InputKind, was_reply: bool, approved: Option<&
     Ok(out)
 }
 
-pub(crate) async fn run(app: &Arc<App>, turn: u64, input: &str, kind: InputKind, was_reply: bool) -> Result<String> {
-    let approved = if kind == InputKind::Approved { app.rt().approving.take() } else { None };
-    let label = match (kind, was_reply) {
-        (InputKind::Bootstrap, _) => "bootstrap",
-        (InputKind::Resume, _) => "resume",
-        (InputKind::Approved, _) => "approved",
-        (InputKind::Progress, _) => "progress check",
-        (_, true) => "check-in reply",
-        _ => "message",
-    };
+impl InputKind {
+    /// How the turn is named in the prompt.
+    pub(crate) fn label(self, was_reply: bool) -> &'static str {
+        match (self, was_reply) {
+            (InputKind::Message, true) => "check-in reply",
+            (InputKind::Message, false) => "message",
+            (InputKind::Bootstrap, _) => "bootstrap",
+            (InputKind::Resume, _) => "resume",
+            (InputKind::Approved, _) => "approved",
+            (InputKind::Progress, _) => "progress check",
+            (InputKind::Report, _) => "report",
+        }
+    }
+
+    /// The heading of the turn's log entry.
+    fn log_kind(self, was_reply: bool) -> &'static str {
+        match (self, was_reply) {
+            (InputKind::Message, true) => "reply",
+            _ => self.label(was_reply),
+        }
+    }
+
+    /// Whether the input is the person's own words, worth quoting in the log. Resumes
+    /// and progress checks are the coach's own prompts.
+    fn is_persons_words(self) -> bool {
+        !matches!(self, InputKind::Resume | InputKind::Progress)
+    }
+}
+
+/// Runs one turn. `approved` is the outgoing action an `Approved` turn may carry out.
+pub(crate) async fn run(
+    app: &Arc<App>,
+    turn: TurnId,
+    input: &str,
+    kind: InputKind,
+    was_reply: bool,
+    approved: Option<Proposal>,
+) -> Result<String> {
+    let label = kind.label(was_reply);
     let framed = format!("{}\n<input kind=\"{label}\">\n{input}\n</input>", context_block(app, kind, was_reply, approved.as_ref())?);
     let mut ctx = TurnCtx { turn, changes: Vec::new(), summary: None, approved };
     let tier = choose_tier(input, kind, &app.settings.llm);
@@ -211,11 +240,10 @@ pub(crate) async fn run(app: &Arc<App>, turn: u64, input: &str, kind: InputKind,
     };
 
     let mut entry = LogEntry::new(
-        if label == "check-in reply" { "reply" } else { label },
+        kind.log_kind(was_reply),
         ctx.summary.clone().unwrap_or_else(|| first_line(&reply)),
     );
-    // Resumes and progress checks are the coach's own prompts, not the person's words.
-    entry.user_reply = (!matches!(kind, InputKind::Resume | InputKind::Progress)).then(|| input.to_string());
+    entry.user_reply = kind.is_persons_words().then(|| input.to_string());
     entry.changes = ctx.changes;
     // A progress check that found nothing isn't worth a log entry every 20 minutes.
     let quiet = kind == InputKind::Progress && entry.changes.is_empty() && reply.trim().is_empty();

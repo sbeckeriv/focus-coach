@@ -7,7 +7,7 @@ mod support;
 use std::time::Duration;
 
 use chrono::Local;
-use focus_core::store::{State, TaskList};
+use focus_core::store::TaskList;
 use focus_core::{Event, Paths, Request, Status, client, daemon};
 use serde_json::json;
 use support::{MockLlm, Reply, calls, text, tool_results, user_prompt, write_config};
@@ -188,7 +188,7 @@ async fn split_and_section_hold_change_the_top_item() {
     let today = &list.sections[0];
     assert!(today.on_hold);
     assert_eq!(today.hold_reason.as_deref(), Some("waiting on release"));
-    assert_eq!(today.tasks[0].state, State::Done);
+    assert!(today.tasks[0].is_done());
     assert_eq!(today.tasks[1].title, "Merge and redeploy");
     assert_eq!(today.tasks[1].due.unwrap().to_string(), "2026-10-30");
     // Held sections are invisible: the top item moves to the next section.
@@ -332,7 +332,16 @@ async fn set_schedule_validates_and_replaces_the_one_schedule() {
     assert_eq!(status.schedule, "*/20 9-17 * * 1-5");
     let next = status.next_checkin.expect("a work-hours schedule always has a next check-in");
     assert!(next > Local::now());
-    assert!(h.file("state.json").contains("*/20 9-17 * * 1-5"));
+    assert!(!h.file("state.json").contains("*/20"), "the schedule isn't saved");
+
+    // focus.toml wins: a restart goes back to the configured schedule.
+    let llm = h.llm.clone();
+    let dir = h._dir;
+    let paths = Paths { home: dir.path().to_path_buf() };
+    client::request(&paths, Request::Shutdown, |_| {}).await.unwrap();
+    h.daemon.await.unwrap().unwrap();
+    let h = Harness { daemon: spawn_daemon(&paths).await, _dir: dir, paths, llm };
+    assert_eq!(h.status().await.schedule, "0 3 1 1 *");
     h.stop().await;
 }
 
@@ -705,5 +714,29 @@ async fn no_progress_check_when_it_is_blank() {
     let events = h.send(Request::CheckIn).await;
     assert!(matches!(&events[0], Event::Ok { text } if text.starts_with("What are you on?")), "{events:?}");
     assert!(h.llm.requests().is_empty(), "a blank progress_check never calls the model");
+    h.stop().await;
+}
+
+#[tokio::test]
+async fn notes_add_context_without_the_model_and_the_coach_sees_them() {
+    let h = start(TASKS).await;
+    let events = h.send(Request::Note { id: "2".into(), text: "staging first, then prod".into() }).await;
+    assert!(
+        matches!(&events[0], Event::Changed { summary, .. } if summary == "note on t2 (Review billing docs): staging first, then prod"),
+        "{events:?}"
+    );
+    h.send(Request::Note { id: "t2".into(), text: "legal signed off".into() }).await;
+    assert!(
+        h.file("tasks.md").contains("  - note: staging first, then prod\n  - note: legal signed off\n"),
+        "notes accumulate:\n{}",
+        h.file("tasks.md")
+    );
+    let events = h.send(Request::Note { id: "t9".into(), text: "x".into() }).await;
+    assert!(matches!(&events[0], Event::Error { .. }), "{events:?}");
+    assert!(h.llm.requests().is_empty());
+
+    h.llm.script([text("Noted.")]);
+    h.say("what's left on billing?").await;
+    assert!(user_prompt(&h.llm.requests()[0]).contains("legal signed off"), "the coach reads notes in the list");
     h.stop().await;
 }

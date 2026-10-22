@@ -27,11 +27,11 @@ async fn run_cmd(program: &str, args: &[&str], ok_codes: &[i32]) -> Result<Strin
 
 /// Posts a comment on a PR or issue. Only reached from an approved action.
 pub async fn comment_on_github(url: &str, body: &str) -> Result<String> {
-    let (host, path) = host_and_path(url);
-    if host != "github.com" {
-        bail!("{url} isn't a GitHub link");
-    }
-    let kind = if path.contains("/pull/") { "pr" } else if path.contains("/issues/") { "issue" } else { bail!("{url} isn't a PR or issue") };
+    let kind = match github_kind(url) {
+        Some(GithubKind::Pull) => "pr",
+        Some(GithubKind::Issue) => "issue",
+        None => bail!("{url} isn't a GitHub PR or issue"),
+    };
     let out = run_cmd("gh", &[kind, "comment", url, "--body", body], &[]).await?;
     Ok(format!("Posted. {}", out.trim()))
 }

@@ -3,8 +3,12 @@
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Datelike, Duration, Local, Timelike};
 
-#[derive(Debug, Clone)]
+/// A parsed schedule. Reads and writes as its expression, so config and state.json
+/// hold plain text and a bad expression fails when it's read.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "String", into = "String")]
 pub struct Cron {
+    expr: String,
     minutes: Vec<bool>,
     hours: Vec<bool>,
     days: Vec<bool>,
@@ -26,6 +30,7 @@ impl Cron {
         }
         weekdays.truncate(7);
         Ok(Self {
+            expr: fields.join(" "),
             minutes: parse_field(min, 0, 59).context("minute field")?,
             hours: parse_field(hour, 0, 23).context("hour field")?,
             days: parse_field(dom, 1, 31).context("day field")?,
@@ -34,6 +39,10 @@ impl Cron {
             days_any: dom == "*",
             weekdays_any: dow == "*",
         })
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.expr
     }
 
     fn matches(&self, t: &DateTime<Local>) -> bool {
@@ -62,6 +71,25 @@ impl Cron {
             t += Duration::minutes(1);
         }
         None
+    }
+}
+
+impl std::fmt::Display for Cron {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.expr)
+    }
+}
+
+impl TryFrom<String> for Cron {
+    type Error = anyhow::Error;
+    fn try_from(expr: String) -> Result<Self> {
+        Cron::parse(&expr)
+    }
+}
+
+impl From<Cron> for String {
+    fn from(cron: Cron) -> String {
+        cron.expr
     }
 }
 

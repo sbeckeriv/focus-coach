@@ -6,6 +6,8 @@ use chrono::{DateTime, Datelike, Local, NaiveTime, Weekday};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkHours {
+    /// As written, for messages and the prompt.
+    text: String,
     pub start: NaiveTime,
     pub end: NaiveTime,
     /// Indexed by days from Monday.
@@ -26,7 +28,7 @@ impl WorkHours {
             bail!("work_hours {text:?}: the end must be after the start");
         }
         let days = if days.trim().is_empty() { [true; 7] } else { weekdays(days.trim())? };
-        Ok(Some(Self { start, end, days }))
+        Ok(Some(Self { text: text.to_string(), start, end, days }))
     }
 
     pub fn is_work_day(&self, at: DateTime<Local>) -> bool {
@@ -37,6 +39,18 @@ impl WorkHours {
         let t = at.time();
         self.is_work_day(at) && t >= self.start && t < self.end
     }
+}
+
+impl std::fmt::Display for WorkHours {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
+/// Reads `work_hours` from config: a string like "9-17 Mon-Fri", or "" for any time.
+pub(crate) fn deserialize<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<WorkHours>, D::Error> {
+    let text = <String as serde::Deserialize>::deserialize(d)?;
+    WorkHours::parse(&text).map_err(serde::de::Error::custom)
 }
 
 fn time(s: &str) -> Result<NaiveTime> {

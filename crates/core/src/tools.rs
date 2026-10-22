@@ -1,9 +1,11 @@
-//! What the model may do. List changes apply directly; lookups are read-only;
-//! nothing here sends anything outward.
+//! What the model may do. List changes apply directly and lookups are read-only;
+//! the one outward tool, `comment_on_github`, only runs for an approved action.
 
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
+use serde::de::{Error as _, IgnoredAny};
+use serde::{Deserialize, Deserializer};
 use chrono::{Local, NaiveDate};
 use serde_json::{Value, json};
 
@@ -13,14 +15,14 @@ use crate::lookup;
 use crate::protocol::Event;
 use crate::provider::ToolCall;
 use crate::report;
-use crate::store::{State, Task};
+use crate::store::{State, Task, TaskId, parse_due};
 
 pub fn definitions() -> Vec<Value> {
     let task_id = json!({"type": "string", "description": "Task id, e.g. \"t3\""});
     vec![
         tool("check_off", "Mark a task done.", json!({
             "task_id": task_id,
-            "note": {"type": "string", "description": "Optional note to keep on the item"},
+            "note": {"type": "string", "description": "Optional note to add to the item"},
         }), &["task_id"]),
         tool("add_task", "Add a task to a section (created if missing). Only for work a source or the person says is theirs.", json!({
             "section": {"type": "string"},
@@ -38,7 +40,7 @@ pub fn definitions() -> Vec<Value> {
             "links": {"type": "array", "items": {"type": "string"}, "description": "Replaces the link list"},
             "due": {"type": "string", "description": "YYYY-MM-DD, or \"none\" to clear"},
             "priority": {"type": "integer"},
-            "note": {"type": "string"},
+            "note": {"type": "string", "description": "Adds a note; earlier notes are kept"},
         }), &["task_id"]),
         tool("remove_task", "Remove a task that turned out not to be the person's or not real.", json!({
             "task_id": task_id,
@@ -58,7 +60,7 @@ pub fn definitions() -> Vec<Value> {
         tool("append_log", "Record one line in the day's log: what the person is on and what changed.", json!({
             "summary": {"type": "string"},
         }), &["summary"]),
-        tool("set_schedule", "Replace the one check-in schedule with a 5-field cron expression (minute hour day month weekday), e.g. \"7,27,47 9-17 * * 1-5\" for every 20 minutes during weekday work hours.", json!({
+        tool("set_schedule", "Replace the one check-in schedule, until the daemon restarts (focus.toml's schedule then applies again), with a 5-field cron expression (minute hour day month weekday), e.g. \"7,27,47 9-17 * * 1-5\" for every 20 minutes during weekday work hours.", json!({
             "cron": {"type": "string"},
         }), &["cron"]),
         tool("pause_checkins", "Stop check-ins until the person's next message.", json!({}), &[]),
@@ -111,130 +113,340 @@ fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> 
 
 /// Runs one call. Failures go back to the model as error results rather than ending the turn.
 pub(crate) async fn execute(app: &Arc<App>, ctx: &mut TurnCtx, call: &ToolCall) -> (String, bool) {
-    match run(app, ctx, &call.name, &call.input).await {
+    let parsed = serde_json::from_value::<Call>(json!({"name": call.name, "input": call.input}))
+        .with_context(|| format!("bad {} call", call.name));
+    let result = match parsed {
+        Ok(parsed) => run(app, ctx, parsed).await,
+        Err(e) => Err(e),
+    };
+    match result {
         Ok(out) => (out, false),
         Err(e) => (format!("error: {e:#}"), true),
     }
 }
 
-fn str_arg<'a>(input: &'a Value, key: &str) -> Option<&'a str> {
-    input.get(key).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty())
+/// Every tool and its arguments, read from the model's call. Field names match the
+/// schemas in [`definitions`]; a test checks that each schema still parses into its variant.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "name", content = "input", rename_all = "snake_case")]
+enum Call {
+    CheckOff(CheckOff),
+    AddTask(AddTask),
+    EditTask(EditTask),
+    RemoveTask(RemoveTask),
+    SetState(SetState),
+    SplitTask(SplitTask),
+    AppendLog(AppendLog),
+    SetSchedule(SetSchedule),
+    PauseCheckins(IgnoredAny),
+    ResumeCheckins(IgnoredAny),
+    WriteReport(IgnoredAny),
+    FetchUrl(FetchUrl),
+    SearchSource(SearchSource),
+    PrStatus(PrStatus),
+    ReadRepo(ReadRepo),
+    AskUser(AskUser),
+    Preview(Preview),
+    ProposeAction(ProposeAction),
+    NoteToSelf(NoteToSelf),
+    CommentOnGithub(CommentOnGithub),
 }
 
-fn req<'a>(input: &'a Value, key: &str) -> Result<&'a str> {
-    str_arg(input, key).with_context(|| format!("missing {key}"))
+#[derive(Debug, Deserialize)]
+struct CheckOff {
+    #[serde(deserialize_with = "task_id")]
+    task_id: TaskId,
+    #[serde(default, deserialize_with = "opt_text")]
+    note: Option<String>,
 }
 
-fn date_arg(input: &Value, key: &str) -> Result<Option<NaiveDate>> {
-    str_arg(input, key)
-        .map(|s| s.parse().with_context(|| format!("{key} must be YYYY-MM-DD, got {s:?}")))
-        .transpose()
+#[derive(Debug, Deserialize)]
+struct AddTask {
+    #[serde(deserialize_with = "text")]
+    section: String,
+    #[serde(deserialize_with = "text")]
+    title: String,
+    #[serde(default, deserialize_with = "opt_links")]
+    links: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "opt_text")]
+    due: Option<String>,
+    #[serde(default, deserialize_with = "opt_priority")]
+    priority: Option<u8>,
+    #[serde(default, deserialize_with = "opt_text")]
+    note: Option<String>,
+    #[serde(default, deserialize_with = "opt_text")]
+    source_ref: Option<String>,
 }
 
-fn links_arg(input: &Value) -> Option<Vec<String>> {
-    input.get("links")?.as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+#[derive(Debug, Deserialize)]
+struct EditTask {
+    #[serde(deserialize_with = "task_id")]
+    task_id: TaskId,
+    #[serde(default, deserialize_with = "opt_text")]
+    title: Option<String>,
+    #[serde(default, deserialize_with = "opt_text")]
+    section: Option<String>,
+    /// Replaces the link list.
+    #[serde(default, deserialize_with = "opt_links")]
+    links: Option<Vec<String>>,
+    /// A date, or "none" to clear it.
+    #[serde(default, deserialize_with = "opt_text")]
+    due: Option<String>,
+    #[serde(default, deserialize_with = "opt_priority")]
+    priority: Option<u8>,
+    #[serde(default, deserialize_with = "opt_text")]
+    note: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RemoveTask {
+    #[serde(deserialize_with = "task_id")]
+    task_id: TaskId,
+    #[serde(deserialize_with = "text")]
+    reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SetState {
+    /// A task id or a section name.
+    #[serde(deserialize_with = "text")]
+    target: String,
+    #[serde(deserialize_with = "text")]
+    state: String,
+    #[serde(default, deserialize_with = "opt_text")]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SplitTask {
+    #[serde(deserialize_with = "task_id")]
+    task_id: TaskId,
+    #[serde(deserialize_with = "text")]
+    done_part: String,
+    #[serde(deserialize_with = "text")]
+    remaining_part: String,
+    #[serde(default, deserialize_with = "opt_text")]
+    due: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AppendLog {
+    #[serde(deserialize_with = "text")]
+    summary: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SetSchedule {
+    #[serde(deserialize_with = "text")]
+    cron: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct FetchUrl {
+    #[serde(deserialize_with = "text")]
+    url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchSource {
+    #[serde(deserialize_with = "text")]
+    source: String,
+    #[serde(default, deserialize_with = "opt_text")]
+    query: Option<String>,
+    #[serde(default)]
+    filters: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct PrStatus {
+    #[serde(deserialize_with = "text")]
+    pr: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReadRepo {
+    #[serde(deserialize_with = "text")]
+    path: String,
+    #[serde(default, deserialize_with = "opt_text")]
+    query: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AskUser {
+    #[serde(deserialize_with = "text")]
+    question: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct Preview {
+    #[serde(deserialize_with = "text")]
+    kind: String,
+    #[serde(deserialize_with = "text")]
+    content: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProposeAction {
+    #[serde(deserialize_with = "text")]
+    kind: String,
+    #[serde(deserialize_with = "text")]
+    target: String,
+    #[serde(deserialize_with = "text")]
+    content: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct NoteToSelf {
+    #[serde(deserialize_with = "text")]
+    text: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CommentOnGithub {
+    #[serde(deserialize_with = "text")]
+    url: String,
+    #[serde(deserialize_with = "text")]
+    body: String,
+}
+
+/// Required text, trimmed; blank counts as missing.
+fn text<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    let s = String::deserialize(d)?;
+    match s.trim() {
+        "" => Err(D::Error::custom("is empty")),
+        t => Ok(t.to_string()),
+    }
+}
+
+/// Optional text, trimmed; blank, null or absent is None. Models fill unused fields with "".
+fn opt_text<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    Ok(Option::<String>::deserialize(d)?.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()))
+}
+
+/// "t3", "3" or 3 all name task t3.
+fn task_id<'de, D: Deserializer<'de>>(d: D) -> Result<TaskId, D::Error> {
+    let id = match Value::deserialize(d)? {
+        Value::String(s) => s,
+        Value::Number(n) => n.to_string(),
+        other => return Err(D::Error::custom(format!("expected a task id like \"t3\", got {other}"))),
+    };
+    match TaskId::parse(&id) {
+        id if id.as_str().is_empty() => Err(D::Error::custom("is empty")),
+        id => Ok(id),
+    }
+}
+
+/// 1 is highest; numbers or numeric strings, capped at 9.
+fn opt_priority<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u8>, D::Error> {
+    let n = match Value::deserialize(d)? {
+        Value::Null => return Ok(None),
+        Value::Number(n) => n.as_u64(),
+        Value::String(s) if s.trim().is_empty() => return Ok(None),
+        Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    };
+    n.map(|n| Some(n.min(9) as u8)).ok_or_else(|| D::Error::custom("priority must be a whole number, 1 highest"))
+}
+
+/// A list of links; a single string is a list of one.
+fn opt_links<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<String>>, D::Error> {
+    Ok(match Value::deserialize(d)? {
+        Value::Null => None,
+        Value::String(s) if s.trim().is_empty() => None,
+        Value::String(s) => Some(vec![s.trim().to_string()]),
+        Value::Array(items) => Some(items.iter().filter_map(Value::as_str).map(|s| s.trim().to_string()).collect()),
+        other => return Err(D::Error::custom(format!("links must be a list of URLs, got {other}"))),
+    })
+}
+
+/// The same forms people type: YYYY-MM-DD, "today", "tomorrow" or a weekday.
+fn due(text: Option<&str>) -> Result<Option<NaiveDate>> {
+    text.map(|s| parse_due(s, Local::now().date_naive()).context("due")).transpose()
 }
 
 fn record(app: &App, ctx: &mut TurnCtx, change: String) {
-    app.emit(Event::Changed { turn: ctx.turn, summary: change.clone() });
+    app.emit(Event::Changed { turn: Some(ctx.turn), summary: change.clone() });
     ctx.changes.push(change);
 }
 
-async fn run(app: &Arc<App>, ctx: &mut TurnCtx, name: &str, input: &Value) -> Result<String> {
+async fn run(app: &Arc<App>, ctx: &mut TurnCtx, call: Call) -> Result<String> {
     let today = Local::now().date_naive();
-    match name {
-        "check_off" => {
-            let id = req(input, "task_id")?;
-            let note = str_arg(input, "note");
+    match call {
+        Call::CheckOff(CheckOff { task_id: id, note }) => {
             let title = app.store.update(|list| {
-                let task = list.get_mut(id)?;
-                task.state = State::Done;
-                task.done_on = Some(today);
-                task.blocked_by = None;
+                let task = list.get_mut(id.as_str())?;
+                task.mark_done(today);
                 if let Some(note) = note {
-                    task.note = Some(note.to_string());
+                    task.add_note(note);
                 }
                 Ok(task.title.clone())
             })?;
             record(app, ctx, format!("done {id}: {title}"));
             Ok(format!("checked off {id}"))
         }
-        "add_task" => {
-            let section = req(input, "section")?;
-            let title = req(input, "title")?;
-            let due = date_arg(input, "due")?;
+        Call::AddTask(a) => {
+            let due = due(a.due.as_deref())?;
             let id = app.store.update(|list| {
-                let mut task = Task::new(list.next_id(), title.to_string());
-                task.links = links_arg(input).unwrap_or_default();
+                let mut task = Task::new(list.next_id(), a.title.clone());
+                task.links = a.links.unwrap_or_default();
                 task.due = due;
-                task.priority = input.get("priority").and_then(Value::as_u64).map(|p| p.min(9) as u8);
-                task.note = str_arg(input, "note").map(String::from);
-                task.source_ref = str_arg(input, "source_ref").map(String::from);
-                Ok(list.add(section, task))
+                task.priority = a.priority;
+                task.notes.extend(a.note);
+                task.source_ref = a.source_ref;
+                Ok(list.add(&a.section, task))
             })?;
-            record(app, ctx, format!("added {id} to {section}: {title}"));
+            record(app, ctx, format!("added {id} to {}: {}", a.section, a.title));
             Ok(format!("added {id}"))
         }
-        "edit_task" => {
-            let id = req(input, "task_id")?;
-            let due = match str_arg(input, "due") {
+        Call::EditTask(e) => {
+            let id = e.task_id;
+            let due = match e.due.as_deref() {
                 Some("none") => Some(None),
-                Some(_) => Some(date_arg(input, "due")?),
-                None => None,
+                other => due(other)?.map(Some),
             };
             let title = app.store.update(|list| {
-                let task = list.get_mut(id)?;
-                if let Some(title) = str_arg(input, "title") {
-                    task.title = title.to_string();
+                let task = list.get_mut(id.as_str())?;
+                if let Some(title) = e.title {
+                    task.title = title;
                 }
-                if let Some(links) = links_arg(input) {
+                if let Some(links) = e.links {
                     task.links = links;
                 }
                 if let Some(due) = due {
                     task.due = due;
                 }
-                if let Some(p) = input.get("priority").and_then(Value::as_u64) {
-                    task.priority = Some(p.min(9) as u8);
+                if let Some(p) = e.priority {
+                    task.priority = Some(p);
                 }
-                if let Some(note) = str_arg(input, "note") {
-                    task.note = Some(note.to_string());
+                if let Some(note) = e.note {
+                    task.add_note(note);
                 }
                 let title = task.title.clone();
-                if let Some(section) = str_arg(input, "section") {
-                    list.move_to(id, section)?;
+                if let Some(section) = e.section {
+                    list.move_to(id.as_str(), &section)?;
                 }
                 Ok(title)
             })?;
             record(app, ctx, format!("edited {id}: {title}"));
             Ok(format!("updated {id}"))
         }
-        "remove_task" => {
-            let id = req(input, "task_id")?;
-            let reason = req(input, "reason")?;
-            let task = app.store.update(|list| list.remove(id))?;
+        Call::RemoveTask(RemoveTask { task_id: id, reason }) => {
+            let task = app.store.update(|list| list.remove(id.as_str()))?;
             record(app, ctx, format!("removed {id}: {} ({reason})", task.title));
             Ok(format!("removed {id}"))
         }
-        "set_state" => {
-            let target = req(input, "target")?;
-            let state = State::parse(req(input, "state")?)?;
-            let reason = str_arg(input, "reason").map(String::from);
+        Call::SetState(SetState { target, state, reason }) => {
+            let state = State::parse(&state, today, reason.clone())?;
             let change = app.store.update(|list| {
-                if let Ok(task) = list.get_mut(target) {
-                    task.state = state;
-                    match state {
-                        State::Blocked => task.blocked_by = reason.clone(),
-                        State::OnHold => {
-                            if let Some(r) = &reason {
-                                task.note = Some(format!("on hold: {r}"));
-                            }
-                        }
-                        State::Open => task.blocked_by = None,
-                        State::Done => task.done_on = Some(today),
+                if let Ok(task) = list.get_mut(&target) {
+                    if let (State::OnHold, Some(r)) = (&state, &reason) {
+                        task.add_note(format!("on hold: {r}"));
                     }
-                    return Ok(format!("{} {target}: {}", state_word(state), task.title));
+                    let word = state_word(&state);
+                    task.state = state;
+                    return Ok(format!("{word} {target}: {}", task.title));
                 }
-                let Some(section) = list.section_mut(target) else {
+                let Some(section) = list.section_mut(&target) else {
                     bail!("no task or section called {target:?}");
                 };
                 match state {
@@ -248,111 +460,146 @@ async fn run(app: &Arc<App>, ctx: &mut TurnCtx, name: &str, input: &Value) -> Re
                     }
                     _ => bail!("a section can only be on_hold or open"),
                 }
-                Ok(format!("{} section {}", state_word(state), section.name))
+                Ok(format!("{} section {}", state_word(&state), section.name))
             })?;
             record(app, ctx, change.clone());
             Ok(change)
         }
-        "split_task" => {
-            let id = req(input, "task_id")?;
-            let done_part = req(input, "done_part")?;
-            let rest = req(input, "remaining_part")?;
-            let due = date_arg(input, "due")?;
+        Call::SplitTask(s) => {
+            let due = due(s.due.as_deref())?;
+            let id = s.task_id;
             let new_id = app.store.update(|list| {
-                let new_id = list.split(id, done_part, rest)?;
+                let new_id = list.split(id.as_str(), &s.done_part, &s.remaining_part)?;
                 if due.is_some() {
-                    list.get_mut(&new_id)?.due = due;
+                    list.get_mut(new_id.as_str())?.due = due;
                 }
                 Ok(new_id)
             })?;
-            record(app, ctx, format!("done {id}: {done_part}; left as {new_id}: {rest}"));
+            record(app, ctx, format!("done {id}: {}; left as {new_id}: {}", s.done_part, s.remaining_part));
             Ok(format!("{id} checked off; remaining work is {new_id}"))
         }
-        "append_log" => {
-            ctx.summary = Some(req(input, "summary")?.to_string());
+        Call::AppendLog(AppendLog { summary }) => {
+            ctx.summary = Some(summary);
             Ok("logged".into())
         }
-        "set_schedule" => {
-            let cron = req(input, "cron")?;
-            let next = app.set_schedule(cron)?;
+        Call::SetSchedule(SetSchedule { cron }) => {
+            let next = app.set_schedule(&cron)?;
             record(app, ctx, format!("schedule set to `{cron}`"));
             Ok(match next {
                 Some(t) => format!("schedule replaced; next check-in {}", t.format("%a %Y-%m-%d %H:%M")),
                 None => "schedule replaced, but it never fires".into(),
             })
         }
-        "pause_checkins" => {
+        Call::PauseCheckins(_) => {
             app.pause();
             record(app, ctx, "check-ins paused until the next message".into());
             Ok("paused until the person's next message".into())
         }
-        "resume_checkins" => {
+        Call::ResumeCheckins(_) => {
             app.resume_timers();
             record(app, ctx, "check-ins resumed".into());
             Ok("check-ins resumed on the current schedule".into())
         }
-        "write_report" => {
+        Call::WriteReport(_) => {
             let (text, path) = report::generate(app).await?;
             let path = path.display().to_string();
             app.emit(Event::Report { turn: ctx.turn, text, path: path.clone() });
             Ok(format!("The report is saved to {path} and already shown to the person. Don't repeat it; just say where it's saved."))
         }
-        "fetch_url" => lookup::fetch_url(req(input, "url")?).await,
-        "search_source" => {
-            let filters = input.get("filters").cloned().unwrap_or(Value::Null);
-            lookup::search(&app.settings.sources, req(input, "source")?, str_arg(input, "query").unwrap_or(""), &filters).await
+        Call::FetchUrl(FetchUrl { url }) => lookup::fetch_url(&url).await,
+        Call::SearchSource(s) => {
+            lookup::search(&app.settings.sources, &s.source, s.query.as_deref().unwrap_or(""), &s.filters).await
         }
-        "pr_status" => lookup::pr_status(req(input, "pr")?).await,
-        "read_repo" => lookup::read_repo(&app.settings.sources, req(input, "path")?, str_arg(input, "query")).await,
-        "ask_user" => {
-            let question = req(input, "question")?.to_string();
+        Call::PrStatus(PrStatus { pr }) => lookup::pr_status(&pr).await,
+        Call::ReadRepo(r) => lookup::read_repo(&app.settings.sources, &r.path, r.query.as_deref()).await,
+        Call::AskUser(AskUser { question }) => {
             app.rt().pending_question = Some(question.clone());
             app.emit(Event::Question { turn: ctx.turn, text: question });
             Ok("Shown to the person. End your turn now with no further text; their answer arrives as the next message.".into())
         }
-        "preview" => {
-            let kind = req(input, "kind")?.to_string();
-            let content = req(input, "content")?.to_string();
+        Call::Preview(Preview { kind, content }) => {
             app.emit(Event::Preview { turn: ctx.turn, kind, content });
             Ok("Shown to the person. Nothing was sent or saved.".into())
         }
-        "propose_action" => {
-            let proposal = app.propose(req(input, "kind")?, req(input, "target")?, req(input, "content")?);
+        Call::ProposeAction(p) => {
+            let proposal = app.propose(&p.kind, &p.target, &p.content);
             let id = proposal.id.clone();
-            record(app, ctx, format!("proposed {id}: {} to {}", proposal.kind, proposal.target));
+            record(app, ctx, format!("proposed {}", proposal.headline()));
             app.emit(Event::Proposal { turn: ctx.turn, proposal });
             Ok(format!(
                 "Proposed as {id}. Nothing was sent. End your turn: say what you proposed and that they can /approve {id} or /reject {id}."
             ))
         }
-        "note_to_self" => {
-            let text = req(input, "text")?.to_string();
+        Call::NoteToSelf(NoteToSelf { text }) => {
             app.notify(&text).await;
             record(app, ctx, format!("note to self: {text}"));
             Ok("Sent to the person as a notification and logged.".into())
         }
-        "comment_on_github" => {
-            let url = req(input, "url")?;
-            let body = req(input, "body")?;
+        Call::CommentOnGithub(CommentOnGithub { url, body }) => {
             let Some(approved) = &ctx.approved else {
                 bail!("not approved: call propose_action and wait for the person to approve it");
             };
-            if approved.target.trim() != url.trim() {
+            if approved.target.trim() != url {
                 bail!("the approved action {} targets {}, not {url}", approved.id, approved.target);
             }
-            let posted = lookup::comment_on_github(url, body).await?;
+            let posted = lookup::comment_on_github(&url, &body).await?;
             record(app, ctx, format!("{}: commented on {url}", approved.id));
             Ok(posted)
         }
-        other => bail!("unknown tool {other}"),
     }
 }
 
-fn state_word(state: State) -> &'static str {
+/// What a change to `state` is called in the log: "reopened" rather than "open".
+fn state_word(state: &State) -> &'static str {
     match state {
         State::Open => "reopened",
-        State::Done => "done",
-        State::OnHold => "on hold",
-        State::Blocked => "blocked",
+        other => other.word(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A call built from a schema's required fields must parse, so the hand-written
+    /// schemas and the argument structs can't drift apart.
+    #[test]
+    fn every_schema_parses_into_its_call() {
+        for def in definitions() {
+            let name = def["name"].as_str().unwrap();
+            let props = &def["input_schema"]["properties"];
+            let mut input = serde_json::Map::new();
+            for field in def["input_schema"]["required"].as_array().unwrap() {
+                let field = field.as_str().unwrap();
+                let value = match props[field]["type"].as_str() {
+                    Some("array") => json!(["x"]),
+                    Some("integer") => json!(1),
+                    Some("object") => json!({}),
+                    _ => props[field]["enum"].get(0).cloned().unwrap_or(json!("t1")),
+                };
+                input.insert(field.to_string(), value);
+            }
+            let call = json!({"name": name, "input": input});
+            if let Err(e) = serde_json::from_value::<Call>(call.clone()) {
+                panic!("{name}: {call}: {e}");
+            }
+        }
+    }
+
+    #[test]
+    fn arguments_are_read_the_way_models_send_them() {
+        let call = |input: Value| serde_json::from_value::<Call>(json!({"name": "add_task", "input": input}));
+        let Ok(Call::AddTask(a)) = call(json!({"section": " Today ", "title": "Ship", "priority": "2", "links": "https://x.y", "note": ""})) else {
+            panic!()
+        };
+        assert_eq!((a.section.as_str(), a.priority, a.note), ("Today", Some(2), None));
+        assert_eq!(a.links.unwrap(), ["https://x.y"]);
+        assert!(call(json!({"section": "Today", "title": "  "})).unwrap_err().to_string().contains("empty"));
+        assert!(call(json!({"title": "Ship"})).unwrap_err().to_string().contains("section"));
+
+        let Ok(Call::CheckOff(c)) = serde_json::from_value::<Call>(json!({"name": "check_off", "input": {"task_id": 3}})) else { panic!() };
+        assert_eq!(c.task_id, "t3", "a bare number names the task");
+        assert!(serde_json::from_value::<Call>(json!({"name": "launch_rockets", "input": {}})).is_err());
+        assert!(serde_json::from_value::<Call>(json!({"name": "pause_checkins", "input": null})).is_ok());
     }
 }

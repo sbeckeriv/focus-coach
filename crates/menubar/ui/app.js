@@ -5,6 +5,8 @@ const $ = (id) => document.getElementById(id);
 const feed = $("feed");
 const input = $("input");
 let paused = false;
+// The daemon decides the top item (Status.top_id); the popover only marks it.
+let topId = null;
 let pending = 0;
 
 function el(tag, cls, text) {
@@ -34,6 +36,7 @@ function setThinking() {
 
 function renderStatus(s) {
   paused = s.paused;
+  topId = s.top_id;
   const status = $("status");
   status.classList.toggle("paused", s.paused);
   status.textContent = summarize(s);
@@ -46,34 +49,37 @@ function summarize(s) {
     : s.next_checkin
       ? `next check-in ${new Date(s.next_checkin).toLocaleTimeString([], { weekday: "short", hour: "2-digit", minute: "2-digit" })}`
       : "no upcoming check-in";
-  return `${s.open} open · ${timer}${s.awaiting_reply ? " · waiting on your reply" : ""}`;
-}
-
-function topOpen(list) {
-  let best = null;
-  list.sections.forEach((section, si) => {
-    if (section.on_hold) return;
-    section.tasks.forEach((task, ti) => {
-      if (task.state !== "open") return;
-      const key = [task.priority ?? 255, si, ti];
-      if (!best || compare(key, best.key) < 0) best = { key, id: task.id };
-    });
-  });
-  return best?.id;
-}
-
-function compare(a, b) {
-  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return a[i] - b[i];
-  return 0;
+  const approvals = s.pending?.length ? ` · ${s.pending.length} awaiting approval` : "";
+  return `${s.open} open · ${timer}${s.awaiting_reply ? " · waiting on your reply" : ""}${approvals}`;
 }
 
 const MARKS = { open: "○", done: "✓", on_hold: "‖", blocked: "!" };
+
+// The task whose notes and links are open, if any.
+let openTask = null;
+
+/// Notes, links and a box to add a note, under a clicked task.
+function details(task) {
+  const box = el("div", "details");
+  for (const note of task.notes ?? []) box.appendChild(el("p", "", `note: ${note}`));
+  for (const link of task.links ?? []) box.appendChild(el("p", "muted", link));
+  if (task.blocked_by) box.appendChild(el("p", "muted", `blocked by ${task.blocked_by}`));
+  const add = el("input");
+  add.placeholder = "Add a note…";
+  add.addEventListener("keydown", (e) => {
+    if (e.key !== "Enter" || !add.value.trim()) return;
+    run(invoke("control", { action: "note", arg: `${task.id} ${add.value.trim()}` }));
+    add.value = "";
+  });
+  box.appendChild(add);
+  return box;
+}
 
 function renderTasks(list) {
   const root = $("tasks");
   root.replaceChildren();
   const today = new Date().toLocaleDateString("en-CA");
-  const top = topOpen(list);
+  const top = topId;
   for (const section of list.sections) {
     const visible = section.tasks.filter((t) => t.state !== "done" || t.done_on === today);
     if (!visible.length && !section.on_hold) continue;
@@ -88,11 +94,17 @@ function renderTasks(list) {
         mark.addEventListener("click", () => run(invoke("control", { action: "toggle", arg: task.id })));
         row.appendChild(mark);
         const name = el("span", "name", task.title);
-        if (task.links?.length) name.title = task.links.join("\n");
+        name.title = "Show notes and links";
+        name.addEventListener("click", () => {
+          openTask = openTask === task.id ? null : task.id;
+          renderTasks(list);
+        });
         row.appendChild(name);
+        if (task.notes?.length) row.appendChild(el("span", "notes", "✎"));
         if (task.due) row.appendChild(el("span", "due", `due ${task.due.slice(5)}`));
         row.appendChild(el("span", "id", task.id));
         box.appendChild(row);
+        if (openTask === task.id) box.appendChild(details(task));
       }
     }
     root.appendChild(box);
@@ -167,7 +179,7 @@ function slash(text) {
   const arg = rest.join(" ").trim() || null;
   const actions = {
     "/next": "next", "/pause": "pause", "/resume": "resume", "/report": "report",
-    "/add": "add", "/start": "start", "/approve": "approve", "/reject": "reject",
+    "/add": "add", "/start": "start", "/approve": "approve", "/reject": "reject", "/note": "note",
   };
   return actions[cmd] ? { action: actions[cmd], arg } : null;
 }
@@ -198,6 +210,32 @@ input.addEventListener("input", () => {
 $("next").addEventListener("click", () => run(invoke("control", { action: "next" })));
 $("report").addEventListener("click", () => run(invoke("control", { action: "report" })));
 $("toggle").addEventListener("click", () => run(invoke("control", { action: paused ? "resume" : "pause" })));
+
+// Drag the bar between the task list and the conversation to resize them. The height
+// is remembered in this window only; storage can be unavailable, which is fine.
+const splitter = $("splitter");
+try {
+  const saved = localStorage.getItem("tasks-height");
+  if (saved) document.body.style.setProperty("--tasks-height", saved);
+} catch {}
+splitter.addEventListener("pointerdown", (e) => {
+  splitter.setPointerCapture(e.pointerId);
+  splitter.classList.add("dragging");
+});
+splitter.addEventListener("pointermove", (e) => {
+  if (!splitter.hasPointerCapture(e.pointerId)) return;
+  const top = $("tasks").getBoundingClientRect().top;
+  const max = window.innerHeight - 160; // leave room for the conversation and input
+  const height = Math.max(48, Math.min(max, e.clientY - top));
+  document.body.style.setProperty("--tasks-height", `${height}px`);
+});
+splitter.addEventListener("pointerup", (e) => {
+  splitter.releasePointerCapture(e.pointerId);
+  splitter.classList.remove("dragging");
+  try {
+    localStorage.setItem("tasks-height", document.body.style.getPropertyValue("--tasks-height"));
+  } catch {}
+});
 
 listen("focus-event", (e) => onEvent(e.payload));
 listen("focus-connected", (e) => {

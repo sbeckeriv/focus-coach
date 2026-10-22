@@ -19,7 +19,7 @@ One daemon owns the single check-in schedule. Every front end talks to it over `
 2. **Install the CLI:**
 
    ```sh
-   cargo install --path crates/focus     # puts `focus` in ~/.cargo/bin
+   cargo install --locked --path crates/focus   # puts `focus` in ~/.cargo/bin
    ```
 
 3. **Pick a model.** See [Models](#models) for details. The options are:
@@ -53,11 +53,11 @@ One daemon owns the single check-in schedule. Every front end talks to it over `
 6. **Optional: the menubar app.**
 
    ```sh
-   cargo install tauri-cli --version "^2"
+   cargo install --locked tauri-cli --version "^2"
    cd crates/menubar && cargo tauri build
    ```
 
-   This builds `Focus Coach.app` under `target/release/bundle/macos/`. Drag it to Applications, then turn on **Start at login** in its menu to keep it always on. While it runs, check-ins arrive as its own notifications; clicking one opens the popover. For a quick try without bundling, run `cargo run -p focus-menubar`. CI also builds the app; see [CI](#ci).
+   This builds `Focus Coach.app` under `target/release/bundle/macos/`. Drag it to Applications, then turn on **Start at login** in its menu to keep it always on. While it runs, check-ins arrive as its own notifications; clicking one opens the popover. The window resizes, and the bar between the tasks and the conversation drags; click a task's title for its notes and links, and to add a note. For a quick try without bundling, run `cargo run -p focus-menubar`. CI also builds the app; see [CI](#ci).
 
    Apps launched from Finder don't see your shell's environment variables, such as `ANTHROPIC_API_KEY`. With the menubar app, use `ant auth login`, the `claude-code` provider, or a local model.
 
@@ -70,6 +70,7 @@ focus say "yup. trying option b."                  # reply to a check-in, ask an
 focus say "add a task: renew passport, due friday"
 focus add "renew passport" --due fri              # add a task instantly (--section, --due)
 focus add https://github.com/org/repo/pull/12      # fetch a link and file it, through the coach
+focus note t3 "waiting on legal"                   # add context to a task (notes accumulate)
 focus approve a1 | reject a1                       # outgoing actions the coach proposed
 focus tasks                                        # the list; --markdown prints tasks.md as stored
 focus checkin                                      # check in now (after the progress check)
@@ -79,12 +80,13 @@ focus autostart on | off                           # start the daemon at login
 
 Nothing goes out without your approval. When the coach wants to send a message, post a PR comment, save a draft or commit, it proposes the action with the exact text and an id like `a1`, then waits. `focus approve a1`, `/approve a1` in the TUI, or the Approve button in the menubar runs one more turn that does exactly that. `focus status` lists what's waiting. Notes to self ("remind me at 3") need no approval.
 
-In the terminal UI, type to talk to the coach. Slash commands map to the CLI: `/next`, `/pause`, `/resume`, `/report`, `/add <title or url>` (with `--due` and `--section`), `/approve <id>`, `/reject <id>`, `/start [sources]` and `/quit`. With the mouse:
+In the terminal UI, type to talk to the coach. Slash commands map to the CLI: `/next`, `/pause`, `/resume`, `/report`, `/add <title or url>` (with `--due` and `--section`), `/note [id] <text>` (the selected task when there's no id), `/approve <id>`, `/reject <id>`, `/copy` and `/start [sources]`. `/quit`, `/exit`, or `exit` on its own closes it. Alt+Enter adds a line break, and pasted text keeps its lines. With the mouse:
 - **Click a task's mark** (○ ▶ ! ✓) to check it off or reopen it. This writes straight to the list, with no model call.
 - **Click a task's title** to see its notes and links. Then press Enter on an empty input to open its first link.
-- **Scroll** the conversation with the wheel or PageUp and PageDown.
+- **Drag the border** between the panes to resize them (or press Alt+←/→).
+- **Scroll** either pane with the wheel; PageUp and PageDown scroll the conversation. Long titles and long input wrap.
 
-Hold Option (or Shift, in some terminals) to select text.
+To copy text, press **F2** for select mode: the mouse goes back to your terminal, so drag to select and copy as usual, then F2 again. **Ctrl+Y** (or `/copy`) copies the coach's last reply straight to the clipboard.
 
 Everything lives in `~/.focus` (override with `FOCUS_HOME`):
 - `tasks.md`: the task list. You can edit it by hand at any time. Items without an `{id=..}` get one on the next save.

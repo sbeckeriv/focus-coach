@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
 
-use crate::config::LlmSettings;
+use crate::config::{Effort, LlmSettings, ProviderKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tier {
@@ -17,6 +17,29 @@ pub enum Tier {
     Light,
     /// Building the list, long docs, design questions, reports.
     Strong,
+}
+
+/// The model and effort for each tier, from the settings.
+struct Models {
+    light: (String, Option<Effort>),
+    strong: (String, Option<Effort>),
+}
+
+impl Models {
+    fn new(llm: &LlmSettings) -> Self {
+        Self {
+            light: (llm.light_model.clone(), llm.light_effort),
+            strong: (llm.strong_model.clone(), llm.strong_effort),
+        }
+    }
+
+    fn get(&self, tier: Tier) -> (&str, Option<Effort>) {
+        let (model, effort) = match tier {
+            Tier::Light => &self.light,
+            Tier::Strong => &self.strong,
+        };
+        (model, *effort)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -43,13 +66,12 @@ pub enum Provider {
 
 impl Provider {
     pub fn from_settings(llm: &LlmSettings) -> Result<Self> {
-        let default_url = match llm.provider.as_str() {
-            "claude" => return Ok(Provider::Claude(Claude::new(llm)?)),
-            "claude-code" | "claude_code" => return Ok(Provider::ClaudeCode(ClaudeCode::new(llm))),
-            "ollama" => "http://localhost:11434/v1",
-            "lmstudio" => "http://localhost:1234/v1",
-            "openai" | "local" | "llamacpp" => "http://localhost:8080/v1",
-            other => bail!("unknown llm.provider {other:?}; use claude, claude-code, ollama, lmstudio or openai"),
+        let default_url = match llm.provider {
+            ProviderKind::Claude => return Ok(Provider::Claude(Claude::new(llm)?)),
+            ProviderKind::ClaudeCode => return Ok(Provider::ClaudeCode(ClaudeCode::new(llm))),
+            ProviderKind::Ollama => "http://localhost:11434/v1",
+            ProviderKind::LmStudio => "http://localhost:1234/v1",
+            ProviderKind::OpenAi => "http://localhost:8080/v1",
         };
         if llm.light_model.starts_with("claude-") || llm.strong_model.starts_with("claude-") {
             bail!(
@@ -78,8 +100,7 @@ impl Provider {
 pub struct Claude {
     http: reqwest::Client,
     base_url: String,
-    light: (String, String),
-    strong: (String, String),
+    models: Models,
 }
 
 /// Models that accept server-side refusal fallbacks (`fallbacks: "default"`).
@@ -90,28 +111,26 @@ impl Claude {
         Ok(Self {
             http: reqwest::Client::builder().timeout(Duration::from_secs(600)).build()?,
             base_url: llm.base_url.as_deref().unwrap_or("https://api.anthropic.com").trim_end_matches('/').to_string(),
-            light: (llm.light_model.clone(), llm.light_effort.clone()),
-            strong: (llm.strong_model.clone(), llm.strong_effort.clone()),
+            models: Models::new(llm),
         })
     }
 
     async fn turn(&self, tier: Tier, system: &str, tools: &[Value], messages: &[Value]) -> Result<Turn> {
-        let (model, effort) = match tier {
-            Tier::Light => &self.light,
-            Tier::Strong => &self.strong,
-        };
+        let (model, effort) = self.models.get(tier);
         let mut body = json!({
             "model": model,
             "max_tokens": 16000,
             "system": [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
             "messages": messages,
-            "output_config": {"effort": effort},
         });
+        if let Some(effort) = effort {
+            body["output_config"] = json!({"effort": effort.as_str()});
+        }
         if !tools.is_empty() {
             body["tools"] = Value::Array(tools.to_vec());
         }
         let mut betas = Vec::new();
-        if FALLBACK_MODELS.contains(&model.as_str()) {
+        if FALLBACK_MODELS.contains(&model) {
             body["fallbacks"] = json!("default");
             betas.push("server-side-fallback-2026-07-01");
         }
@@ -159,7 +178,7 @@ impl Claude {
             }
             let resp = req.send().await.context("calling the Claude API")?;
             let status = resp.status();
-            let retryable = status.as_u16() == 429 || status.as_u16() == 529 || status.is_server_error();
+            let retryable = status.as_u16() == 429 || status.is_server_error();
             if retryable && attempt < 2 {
                 let wait = resp
                     .headers()
@@ -187,8 +206,7 @@ impl Claude {
 pub struct Local {
     http: reqwest::Client,
     base_url: String,
-    light: String,
-    strong: String,
+    models: Models,
     api_key: Option<String>,
 }
 
@@ -202,17 +220,13 @@ impl Local {
             // Local models can be slow on a laptop.
             http: reqwest::Client::builder().timeout(Duration::from_secs(900)).build()?,
             base_url: llm.base_url.as_deref().unwrap_or(default_url).trim_end_matches('/').to_string(),
-            light: llm.light_model.clone(),
-            strong: llm.strong_model.clone(),
+            models: Models::new(llm),
             api_key,
         })
     }
 
     async fn turn(&self, tier: Tier, system: &str, tools: &[Value], messages: &[Value]) -> Result<Turn> {
-        let model = match tier {
-            Tier::Light => &self.light,
-            Tier::Strong => &self.strong,
-        };
+        let (model, _) = self.models.get(tier);
         let mut body = json!({"model": model, "messages": to_openai_messages(system, messages)});
         if !tools.is_empty() {
             body["tools"] = to_openai_tools(tools);
@@ -381,8 +395,7 @@ async fn auth() -> Result<Auth> {
 /// drives the tool loop itself: its built-in tools plus the coach's, served by `focus mcp`.
 pub struct ClaudeCode {
     command: Option<String>,
-    light: (String, String),
-    strong: (String, String),
+    models: Models,
     /// Tools Claude Code may use without asking (`claude_code_tools`).
     tools: Vec<String>,
     /// Load the person's own MCP servers next to `focus mcp`.
@@ -393,8 +406,7 @@ impl ClaudeCode {
     fn new(llm: &LlmSettings) -> Self {
         Self {
             command: llm.command.clone(),
-            light: (llm.light_model.clone(), llm.light_effort.clone()),
-            strong: (llm.strong_model.clone(), llm.strong_effort.clone()),
+            models: Models::new(llm),
             tools: llm.claude_code_tools.clone(),
             user_mcp: llm.claude_code_user_mcp,
         }
@@ -452,10 +464,7 @@ impl ClaudeCode {
         cwd: Option<&Path>,
         session: Option<(&str, bool)>,
     ) -> Result<String> {
-        let (model, effort) = match tier {
-            Tier::Light => &self.light,
-            Tier::Strong => &self.strong,
-        };
+        let (model, effort) = self.models.get(tier);
         let program = self.program();
         let mut cmd = tokio::process::Command::new(&program);
         cmd.args(["-p", "--output-format", "json", "--model", model]);
@@ -465,8 +474,8 @@ impl ClaudeCode {
             None => cmd.arg("--no-session-persistence"),
         };
         cmd.args(["--system-prompt", system]);
-        if !effort.is_empty() {
-            cmd.args(["--effort", effort]);
+        if let Some(effort) = effort {
+            cmd.args(["--effort", effort.as_str()]);
         }
         match mcp {
             Some(config) => {
@@ -557,9 +566,9 @@ mod tests {
 
     #[test]
     fn local_provider_rejects_claude_models() {
-        let llm = LlmSettings { provider: "ollama".into(), ..Default::default() };
+        let llm = LlmSettings { provider: ProviderKind::Ollama, ..Default::default() };
         assert!(Provider::from_settings(&llm).is_err());
-        let llm = LlmSettings { provider: "ollama".into(), light_model: "qwen3:8b".into(), strong_model: "qwen3:32b".into(), ..Default::default() };
+        let llm = LlmSettings { provider: ProviderKind::Ollama, light_model: "qwen3:8b".into(), strong_model: "qwen3:32b".into(), ..Default::default() };
         assert!(matches!(Provider::from_settings(&llm), Ok(Provider::Local(_))));
     }
 }

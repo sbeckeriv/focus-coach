@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use focus_core::store::TaskList;
-use focus_core::{Event, Paths, Request, Status, client, daemon};
+use focus_core::{Event, Paths, Request, Status, TaskId, client, daemon};
 use tauri::image::Image;
 use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -30,7 +30,7 @@ fn now_ms() -> u64 {
 async fn send(paths: &Paths, req: Request) -> Result<Vec<Event>, String> {
     let mut direct = Vec::new();
     client::request(paths, req, |ev| {
-        if matches!(ev, Event::Ok { .. } | Event::Error { turn: 0, .. }) {
+        if matches!(ev, Event::Ok { .. } | Event::Error { turn: None, .. }) {
             direct.push(ev);
         }
     })
@@ -53,14 +53,17 @@ fn control_request(action: &str, arg: Option<String>) -> Result<Request, String>
         "resume" => Request::Resume,
         "next" => Request::Next,
         "report" => Request::Report,
-        "add" => {
-            let text = need("a title or a URL")?;
-            let is_link = !text.contains(char::is_whitespace) && (text.starts_with("http://") || text.starts_with("https://"));
-            if is_link { Request::Add { url: text } } else { Request::New { title: text, section: None, due: None } }
+        "add" => Request::add(&need("a title or a URL")?, None, None),
+        "toggle" => Request::Toggle { id: TaskId::parse(&need("a task id")?) },
+        "approve" => Request::Approve { id: need("an action id")?.as_str().into() },
+        "reject" => Request::Reject { id: need("an action id")?.as_str().into() },
+        "note" => {
+            let text = need("a task id and the note")?;
+            match text.split_once(char::is_whitespace) {
+                Some((id, note)) if !note.trim().is_empty() => Request::Note { id: TaskId::parse(id), text: note.trim().to_string() },
+                _ => return Err("note needs a task id and the note, e.g. t3 waiting on legal".into()),
+            }
         }
-        "toggle" => Request::Toggle { id: need("a task id")? },
-        "approve" => Request::Approve { id: need("an action id")? },
-        "reject" => Request::Reject { id: need("an action id")? },
         "start" => Request::Start { text: arg },
         other => return Err(format!("unknown action {other}")),
     })
@@ -194,7 +197,7 @@ fn menu_action(app: &AppHandle, id: &str) {
                 let _ = app.emit("focus-event", ev);
             }),
             Err(text) => {
-                let _ = app.emit("focus-event", Event::Error { turn: 0, text });
+                let _ = app.emit("focus-event", Event::error(text));
             }
         }
     });
@@ -208,7 +211,7 @@ fn toggle_login(app: &AppHandle) {
     let on = autolaunch.is_enabled().unwrap_or(false);
     let result = if on { autolaunch.disable() } else { autolaunch.enable() };
     if let Err(e) = result {
-        let _ = app.emit("focus-event", Event::Error { turn: 0, text: format!("start at login: {e}") });
+        let _ = app.emit("focus-event", Event::error(format!("start at login: {e}")));
     }
     if let Some(item) = app.try_state::<LoginItem>() {
         let _ = item.0.set_checked(autolaunch.is_enabled().unwrap_or(false));
@@ -323,6 +326,7 @@ mod tests {
             missed: 0,
             busy: false,
             top: None,
+            top_id: None,
             open: 0,
             session: None,
             pending: vec![],
@@ -350,6 +354,8 @@ mod tests {
         assert!(matches!(control_request("approve", Some("a1".into())), Ok(Request::Approve { id }) if id == "a1"));
         assert!(matches!(control_request("reject", Some("a1".into())), Ok(Request::Reject { id }) if id == "a1"));
         assert!(control_request("toggle", None).is_err());
+        assert!(matches!(control_request("note", Some("3 waiting on legal".into())), Ok(Request::Note { id, text }) if id == "t3" && text == "waiting on legal"));
+        assert!(control_request("note", Some("t3".into())).is_err(), "a note needs text");
         assert!(matches!(control_request("start", Some("my PRs".into())), Ok(Request::Start { text: Some(_) })));
         assert!(control_request("explode", None).is_err());
     }

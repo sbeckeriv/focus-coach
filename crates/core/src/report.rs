@@ -43,7 +43,9 @@ pub(crate) async fn generate(app: &App) -> Result<(String, PathBuf)> {
     let turn = app.provider.turn(Tier::Strong, REPORT_PROMPT, &[], &messages).await?;
     let text = turn.text.trim().to_string();
     let path = app.paths.reports().join(format!("{today}.md"));
-    std::fs::write(&path, format!("# Focus report {today}\n\n{text}\n"))?;
+    crate::store::write_atomic(&path, &format!("# Focus report {today}\n\n{text}\n"))?;
     app.log.append(&LogEntry::new("report", format!("End-of-day report saved to {}", path.display())))?;
+    // However it was asked for, today's report is done; the automatic one won't repeat it.
+    app.reported(today);
     Ok((text, path))
 }

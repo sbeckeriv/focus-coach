@@ -15,14 +15,13 @@ use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Notify, broadcast, watch};
 
-use crate::config::{Notifier, Paths, Settings};
-use crate::hours::WorkHours;
+use crate::config::{Notifier, Paths, ReportAt, Settings};
 use crate::interpreter::{self, InputKind};
 use crate::log::{Log, LogEntry};
-use crate::protocol::{Event, Proposal, Request, Status};
+use crate::protocol::{ActionId, Event, Proposal, Request, Status, TurnId};
 use crate::provider::{Provider, ToolCall};
 use crate::schedule::Cron;
-use crate::store::{self, State, Store, Task};
+use crate::store::{self, Store, Task, TaskId};
 use crate::{report, tools};
 
 const RESUME_PROMPT: &str = "I'm back. Summarize where things stand.";
@@ -35,7 +34,6 @@ pub struct App {
     pub(crate) provider: Provider,
     pub(crate) store: Store,
     pub(crate) log: Log,
-    work_hours: Option<WorkHours>,
     runtime: Mutex<Runtime>,
     events: broadcast::Sender<Event>,
     rearm: watch::Sender<u64>,
@@ -48,26 +46,35 @@ pub struct App {
     shutdown: Notify,
 }
 
-#[derive(Default)]
+/// The daemon's state. Fields not marked `skip` are saved to state.json and survive a
+/// restart; the rest is rebuilt from the store and the clock.
+#[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
 pub(crate) struct Runtime {
     pub paused: bool,
-    pub schedule: String,
-    pub next_checkin: Option<DateTime<Local>>,
-    pub awaiting_reply: bool,
-    pub missed: u32,
-    pub last_checkin: Option<String>,
-    pub pending_question: Option<String>,
-    /// Recent (input, reply) pairs, oldest first.
-    pub recap: VecDeque<(String, String)>,
-    pub busy: bool,
+    /// The one check-in schedule. Starts as focus.toml's on every start, so the config
+    /// always wins; a turn can change it until the next restart. Not saved.
+    #[serde(skip)]
+    pub schedule: Option<Cron>,
     pub session: Option<ClaudeSession>,
     /// Outgoing actions waiting for approval.
     pub pending: Vec<Proposal>,
     next_action: u32,
-    /// The approved action for the turn about to run.
-    pub approving: Option<Proposal>,
     last_bootstrap: Option<NaiveDate>,
     last_report: Option<NaiveDate>,
+    #[serde(skip)]
+    pub next_checkin: Option<DateTime<Local>>,
+    #[serde(skip)]
+    pub awaiting_reply: bool,
+    #[serde(skip)]
+    pub missed: u32,
+    #[serde(skip)]
+    pub last_checkin: Option<String>,
+    #[serde(skip)]
+    pub pending_question: Option<String>,
+    /// Recent (input, reply) pairs, oldest first.
+    #[serde(skip)]
+    pub recap: VecDeque<(String, String)>,
 }
 
 /// The Claude Code session claude-code turns resume.
@@ -77,19 +84,6 @@ pub(crate) struct ClaudeSession {
     pub date: NaiveDate,
     /// Whether Claude Code has saved it yet, so the next turn resumes instead of creating it.
     pub started: bool,
-}
-
-/// What survives a restart. Everything else is rebuilt from the store.
-#[derive(Default, Serialize, Deserialize)]
-#[serde(default)]
-struct Persisted {
-    paused: bool,
-    schedule: Option<String>,
-    session: Option<ClaudeSession>,
-    pending: Vec<Proposal>,
-    next_action: u32,
-    last_bootstrap: Option<NaiveDate>,
-    last_report: Option<NaiveDate>,
 }
 
 /// Decrements the notifier count when a notifying subscriber goes away.
@@ -105,28 +99,17 @@ impl App {
     fn new(paths: Paths) -> Result<Self> {
         let settings = Settings::load(&paths)?;
         let provider = Provider::from_settings(&settings.llm)?;
-        let work_hours = WorkHours::parse(&settings.work_hours)?;
-        let persisted: Persisted = std::fs::read_to_string(paths.state())
+        let mut runtime: Runtime = std::fs::read_to_string(paths.state())
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
-        let runtime = Runtime {
-            paused: persisted.paused,
-            schedule: persisted.schedule.unwrap_or_else(|| settings.schedule.clone()),
-            session: persisted.session,
-            pending: persisted.pending,
-            next_action: persisted.next_action,
-            last_bootstrap: persisted.last_bootstrap,
-            last_report: persisted.last_report,
-            ..Default::default()
-        };
+        runtime.schedule = Some(settings.schedule.clone());
         Ok(Self {
             store: Store::new(&paths.tasks()).with_archive(&paths.done()),
             log: Log::new(&paths.log()),
             paths,
             settings,
             provider,
-            work_hours,
             runtime: Mutex::new(runtime),
             events: broadcast::channel(256).0,
             rearm: watch::channel(0).0,
@@ -149,18 +132,19 @@ impl App {
 
     pub(crate) fn status(&self) -> Status {
         let list = self.store.load().unwrap_or_default();
-        let open = list.tasks().filter(|(s, t)| !s.on_hold && t.state == State::Open).count();
-        let top = list.top_open().map(|t| format!("{} ({})", t.title, t.id));
+        let top = list.top_open();
         let rt = self.rt();
         Status {
             paused: rt.paused,
-            schedule: rt.schedule.clone(),
+            schedule: self.schedule_of(&rt).to_string(),
             next_checkin: rt.next_checkin,
             awaiting_reply: rt.awaiting_reply,
             missed: rt.missed,
-            busy: rt.busy,
-            top,
-            open,
+            // Every turn holds the lock, so busy can't drift from what's actually running.
+            busy: self.turn_lock.try_lock().is_err(),
+            top: top.map(Task::label),
+            top_id: top.map(|t| t.id.clone()),
+            open: list.open_count(),
             session: matches!(self.provider, Provider::ClaudeCode(_))
                 .then(|| rt.session.as_ref().map(|s| s.id.clone()))
                 .flatten(),
@@ -197,21 +181,16 @@ impl App {
     }
 
     fn persist(&self) {
-        let state = {
-            let rt = self.rt();
-            Persisted {
-                paused: rt.paused,
-                schedule: Some(rt.schedule.clone()),
-                session: rt.session.clone(),
-                pending: rt.pending.clone(),
-                next_action: rt.next_action,
-                last_bootstrap: rt.last_bootstrap,
-                last_report: rt.last_report,
-            }
-        };
-        if let Ok(json) = serde_json::to_string_pretty(&state) {
-            let _ = std::fs::write(self.paths.state(), json);
+        let json = serde_json::to_string_pretty(&*self.rt());
+        if let Ok(json) = json {
+            let _ = store::write_atomic(&self.paths.state(), &json);
         }
+    }
+
+    /// Today's report is written, however it was asked for.
+    pub(crate) fn reported(&self, day: NaiveDate) {
+        self.rt().last_report = Some(day);
+        self.persist();
     }
 
     /// Pauses check-ins until the person's next message.
@@ -235,10 +214,15 @@ impl App {
 
     pub(crate) fn set_schedule(&self, expr: &str) -> Result<Option<DateTime<Local>>> {
         let cron = Cron::parse(expr)?;
-        self.rt().schedule = expr.trim().to_string();
-        self.persist();
+        let next = self.next_fire(&cron, Local::now());
+        self.rt().schedule = Some(cron);
         self.rearm.send_modify(|g| *g += 1);
-        Ok(self.next_fire(&cron, Local::now()))
+        Ok(next)
+    }
+
+    /// The current schedule.
+    fn schedule_of(&self, rt: &Runtime) -> Cron {
+        rt.schedule.clone().unwrap_or_else(|| self.settings.schedule.clone())
     }
 
     /// Records an outgoing action for the person to approve.
@@ -247,7 +231,7 @@ impl App {
             let mut rt = self.rt();
             rt.next_action += 1;
             let proposal = Proposal {
-                id: format!("a{}", rt.next_action),
+                id: ActionId::numbered(rt.next_action),
                 kind: kind.to_string(),
                 target: target.to_string(),
                 content: content.to_string(),
@@ -260,10 +244,10 @@ impl App {
         proposal
     }
 
-    fn take_pending(&self, id: &str) -> Result<Proposal> {
+    fn take_pending(&self, id: &ActionId) -> Result<Proposal> {
         let proposal = {
             let mut rt = self.rt();
-            let index = rt.pending.iter().position(|p| p.id == id.trim()).with_context(|| {
+            let index = rt.pending.iter().position(|p| p.id == *id).with_context(|| {
                 format!("nothing awaiting approval as {id}")
             })?;
             rt.pending.remove(index)
@@ -273,12 +257,23 @@ impl App {
         Ok(proposal)
     }
 
-    /// A check-in or note to self, as a desktop notification unless a front end shows its own.
+    /// A note to self: shown by front ends that notify, or as a desktop notification.
     pub(crate) async fn notify(&self, text: &str) {
         self.emit(Event::Note { text: text.to_string() });
+        self.notify_desktop(text).await;
+    }
+
+    /// The daemon's own notification, unless a subscriber (the menubar app) shows them.
+    async fn notify_desktop(&self, text: &str) {
         if self.settings.notifier == Notifier::Desktop && self.notifiers.load(Ordering::Relaxed) == 0 {
             notify_desktop(text).await;
         }
+    }
+
+    /// Whether today's morning bootstrap still has to run.
+    fn morning_due(&self) -> bool {
+        !self.settings.morning_bootstrap.trim().is_empty()
+            && self.rt().last_bootstrap != Some(Local::now().date_naive())
     }
 
     /// The next cron time inside work hours.
@@ -287,7 +282,7 @@ impl App {
         // A year ahead is plenty to find one inside work hours, or to show there's none.
         let horizon = after + chrono::Duration::days(366);
         while t <= horizon {
-            if self.work_hours.as_ref().is_none_or(|w| w.contains(t)) {
+            if self.settings.work_hours.as_ref().is_none_or(|w| w.contains(t)) {
                 return Some(t);
             }
             t = cron.next_after(t)?;
@@ -297,41 +292,47 @@ impl App {
 
     /// Today's automatic report time, if there is one.
     fn report_time(&self, now: DateTime<Local>) -> Option<DateTime<Local>> {
-        let at = self.settings.report_at.trim();
-        let time = match at {
-            "" | "off" => return None,
-            "end" => self.work_hours.as_ref().map_or(NaiveTime::from_hms_opt(17, 0, 0)?, |w| w.end),
-            _ => NaiveTime::parse_from_str(at, "%H:%M").ok()?,
+        let time = match self.settings.report_at {
+            ReportAt::Off => return None,
+            ReportAt::End => self.settings.work_hours.as_ref().map_or(NaiveTime::from_hms_opt(17, 0, 0)?, |w| w.end),
+            ReportAt::At(time) => time,
         };
-        if self.work_hours.as_ref().is_some_and(|w| !w.is_work_day(now)) {
+        if self.settings.work_hours.as_ref().is_some_and(|w| !w.is_work_day(now)) {
             return None;
         }
         now.date_naive().and_time(time).and_local_timezone(Local).single()
     }
 
-    /// Runs the morning bootstrap if this is the day's first interaction. Holds no lock;
-    /// the caller has the turn lock.
-    async fn morning(self: &Arc<Self>, turn: u64) {
-        let today = Local::now().date_naive();
-        let prompt = self.settings.morning_bootstrap.trim().to_string();
-        {
-            let mut rt = self.rt();
-            if prompt.is_empty() || rt.last_bootstrap == Some(today) {
-                return;
-            }
-            rt.last_bootstrap = Some(today);
+    /// Runs the morning bootstrap if this is the day's first interaction, and returns its
+    /// reply. The caller holds the turn lock.
+    async fn morning(self: &Arc<Self>, turn: TurnId) -> Option<String> {
+        if !self.morning_due() {
+            return None;
         }
+        self.rt().last_bootstrap = Some(Local::now().date_naive());
         self.persist();
-        match interpreter::run(self, turn, &prompt, InputKind::Bootstrap, false).await {
-            Ok(reply) if !reply.trim().is_empty() => self.emit(Event::Reply { turn, text: reply }),
-            Ok(_) => {}
-            Err(e) => self.emit(Event::Error { turn, text: format!("morning bootstrap: {e:#}") }),
+        let prompt = self.settings.morning_bootstrap.trim().to_string();
+        self.side_turn(turn, &prompt, InputKind::Bootstrap).await
+    }
+
+    /// A turn the coach starts on its own (morning bootstrap, progress check): errors
+    /// are shown, not returned. The caller holds the turn lock.
+    async fn side_turn(self: &Arc<Self>, turn: TurnId, prompt: &str, kind: InputKind) -> Option<String> {
+        match interpreter::run(self, turn, prompt, kind, false, None).await {
+            Ok(reply) => Some(reply.trim().to_string()).filter(|r| !r.is_empty()),
+            Err(e) => {
+                self.emit(Event::Error { turn: Some(turn), text: format!("{}: {e:#}", kind.label(false)) });
+                None
+            }
         }
     }
 
-    async fn handle_input(self: Arc<Self>, turn: u64, text: String, kind: InputKind, approved: Option<Proposal>) {
+    fn new_turn(&self) -> TurnId {
+        TurnId(self.next_turn.fetch_add(1, Ordering::Relaxed) + 1)
+    }
+
+    async fn handle_input(self: Arc<Self>, turn: TurnId, text: String, kind: InputKind, approved: Option<Proposal>) {
         let _guard = self.turn_lock.lock().await;
-        self.housekeeping();
         let (was_reply, unpaused) = {
             let mut rt = self.rt();
             let was_reply = rt.awaiting_reply;
@@ -341,8 +342,6 @@ impl App {
             if unpaused {
                 rt.paused = false;
             }
-            rt.busy = true;
-            rt.approving = approved;
             if kind == InputKind::Bootstrap {
                 rt.last_bootstrap = Some(Local::now().date_naive());
             }
@@ -355,22 +354,24 @@ impl App {
             self.rearm.send_modify(|g| *g += 1);
         }
         self.emit_status();
-        if matches!(kind, InputKind::Message | InputKind::Resume) {
-            self.morning(turn).await;
+        if matches!(kind, InputKind::Message | InputKind::Resume)
+            && let Some(reply) = self.morning(turn).await
+        {
+            self.emit(Event::Reply { turn, text: reply });
         }
 
         let result = match kind {
             InputKind::Report => report::generate(&self).await.map(|(text, path)| {
                 self.emit(Event::Report { turn, text, path: path.display().to_string() });
-                self.rt().last_report = Some(Local::now().date_naive());
-                self.persist();
                 String::new()
             }),
-            _ => interpreter::run(&self, turn, &text, kind, was_reply).await,
+            _ => interpreter::run(&self, turn, &text, kind, was_reply, approved).await,
         };
         // With archive_after_days = 0, what the turn just checked off goes now.
         self.housekeeping();
         match result {
+            // The report is its own event, not part of the conversation.
+            Ok(_) if kind == InputKind::Report => {}
             Ok(reply) => {
                 if !reply.trim().is_empty() {
                     self.emit(Event::Reply { turn, text: reply.clone() });
@@ -381,13 +382,9 @@ impl App {
                     rt.recap.pop_front();
                 }
             }
-            Err(e) => self.emit(Event::Error { turn, text: format!("{e:#}") }),
+            Err(e) => self.emit(Event::Error { turn: Some(turn), text: format!("{e:#}") }),
         }
-        {
-            let mut rt = self.rt();
-            rt.busy = false;
-            rt.approving = None;
-        }
+        drop(_guard);
         self.emit_status();
         self.emit(Event::TurnDone { turn });
     }
@@ -395,14 +392,8 @@ impl App {
     async fn scheduler(self: Arc<Self>) {
         let mut rearm = self.rearm.subscribe();
         'outer: loop {
-            let expr = self.rt().schedule.clone();
-            let next = match Cron::parse(&expr) {
-                Ok(cron) => self.next_fire(&cron, Local::now()),
-                Err(e) => {
-                    self.emit(Event::Error { turn: 0, text: format!("schedule {expr:?}: {e:#}") });
-                    None
-                }
-            };
+            let cron = self.schedule_of(&self.rt());
+            let next = self.next_fire(&cron, Local::now());
             self.rt().next_checkin = next;
             self.emit_status();
             let Some(next) = next else {
@@ -429,20 +420,27 @@ impl App {
         }
     }
 
-    /// The automatic end-of-day report, once per work day.
-    async fn report_timer(self: Arc<Self>) {
+    /// Once-a-day jobs: housekeeping when the date rolls over (yesterday's done items
+    /// move out), and the automatic end-of-day report.
+    async fn daily_timer(self: Arc<Self>) {
+        let mut housekept = Local::now().date_naive();
+        let mut first = true;
         loop {
+            if !std::mem::take(&mut first) {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
             let now = Local::now();
+            if now.date_naive() != housekept {
+                housekept = now.date_naive();
+                self.housekeeping();
+            }
             let due = self.report_time(now).is_some_and(|at| now >= at && now - at < REPORT_GRACE)
                 && self.rt().last_report != Some(now.date_naive());
             if due {
                 // Marked first, so a slow report doesn't start twice.
-                self.rt().last_report = Some(now.date_naive());
-                self.persist();
-                let turn = self.next_turn.fetch_add(1, Ordering::Relaxed) + 1;
-                self.clone().handle_input(turn, "end-of-day report".into(), InputKind::Report, None).await;
+                self.reported(now.date_naive());
+                self.clone().handle_input(self.new_turn(), "end-of-day report".into(), InputKind::Report, None).await;
             }
-            tokio::time::sleep(Duration::from_secs(30)).await;
         }
     }
 
@@ -450,29 +448,20 @@ impl App {
         if self.rt().paused {
             return;
         }
-        // The first check-in of the day builds the list first.
-        let wants_morning = {
-            let rt = self.rt();
-            !self.settings.morning_bootstrap.trim().is_empty() && rt.last_bootstrap != Some(Local::now().date_naive())
-        };
-        if wants_morning {
-            let turn = self.next_turn.fetch_add(1, Ordering::Relaxed) + 1;
-            let _guard = self.turn_lock.lock().await;
-            self.morning(turn).await;
-            self.emit(Event::TurnDone { turn });
-        }
-        // Otherwise the progress check, so the check-in already reflects what sources show.
+        // The first check-in of the day builds the list; later ones run the progress check,
+        // so the check-in already reflects what the sources show.
         let progress = self.settings.progress_check.trim().to_string();
         let mut noticed = None;
-        if !wants_morning && !progress.is_empty() {
-            let turn = self.next_turn.fetch_add(1, Ordering::Relaxed) + 1;
-            let _guard = self.turn_lock.lock().await;
-            self.rt().busy = true;
-            match interpreter::run(self, turn, &progress, InputKind::Progress, false).await {
-                Ok(reply) => noticed = Some(reply.trim().to_string()).filter(|r| !r.is_empty()),
-                Err(e) => self.emit(Event::Error { turn, text: format!("progress check: {e:#}") }),
+        if self.morning_due() || !progress.is_empty() {
+            let turn = self.new_turn();
+            let guard = self.turn_lock.lock().await;
+            self.emit_status();
+            match self.morning(turn).await {
+                Some(reply) => self.emit(Event::Reply { turn, text: reply }),
+                None if !progress.is_empty() => noticed = self.side_turn(turn, &progress, InputKind::Progress).await,
+                None => {}
             }
-            self.rt().busy = false;
+            drop(guard);
             self.emit(Event::TurnDone { turn });
         }
         self.housekeeping();
@@ -493,17 +482,12 @@ impl App {
         let _ = self.log.append(&LogEntry::new("check-in", text.clone()));
         self.emit(Event::CheckIn { text: text.clone() });
         self.emit_status();
-        if self.settings.notifier == Notifier::Desktop && self.notifiers.load(Ordering::Relaxed) == 0 {
-            notify_desktop(&text).await;
-        }
+        self.notify_desktop(&text).await;
     }
 
-    /// Runs `text` as a turn and streams that turn's events back to `out`.
-    async fn turn(self: &Arc<Self>, out: &mut OwnedWriteHalf, text: String, kind: InputKind) -> Result<()> {
-        self.turn_approved(out, text, kind, None).await
-    }
-
-    async fn turn_approved(
+    /// Runs `text` as a turn and streams that turn's events back to `out`. `approved` is
+    /// the outgoing action an `Approved` turn may carry out.
+    async fn turn(
         self: &Arc<Self>,
         out: &mut OwnedWriteHalf,
         text: String,
@@ -511,12 +495,12 @@ impl App {
         approved: Option<Proposal>,
     ) -> Result<()> {
         let mut rx = self.events.subscribe();
-        let turn = self.next_turn.fetch_add(1, Ordering::Relaxed) + 1;
+        let turn = self.new_turn();
         // Spawned, so the turn finishes even if this client disconnects.
         tokio::spawn(self.clone().handle_input(turn, text, kind, approved));
         loop {
             match rx.recv().await {
-                Ok(ev) if ev.turn() == turn => {
+                Ok(ev) if ev.turn() == Some(turn) => {
                     let done = matches!(ev, Event::TurnDone { .. });
                     write_event(out, &ev).await?;
                     if done {
@@ -548,19 +532,31 @@ impl App {
     }
 
     /// Flips a task between done and open, straight from a checkbox click.
-    fn toggle(&self, id: &str) -> Result<String> {
+    fn toggle(&self, id: &TaskId) -> Result<String> {
         let today = Local::now().date_naive();
         let summary = self.store.update(|list| {
-            let task = list.get_mut(id)?;
-            let done = task.state != State::Done;
-            task.state = if done { State::Done } else { State::Open };
-            task.done_on = done.then_some(today);
-            if done {
-                task.blocked_by = None;
-            }
+            let task = list.get_mut(id.as_str())?;
+            let done = !task.is_done();
+            if done { task.mark_done(today) } else { task.reopen() }
             Ok(format!("{} {id}: {}", if done { "done" } else { "reopened" }, task.title))
         })?;
         self.changed_by_hand("checkbox", &summary)?;
+        Ok(summary)
+    }
+
+    /// Adds a note to a task, with no model call.
+    fn add_note(&self, id: &TaskId, text: &str) -> Result<String> {
+        let text = text.trim();
+        if text.is_empty() {
+            bail!("a note needs some text");
+        }
+        let title = self.store.update(|list| {
+            let task = list.get_mut(id.as_str())?;
+            task.add_note(text);
+            Ok(task.title.clone())
+        })?;
+        let summary = format!("note on {id} ({title}): {text}");
+        self.changed_by_hand("note", &summary)?;
         Ok(summary)
     }
 
@@ -571,7 +567,7 @@ impl App {
             bail!("a task needs a title");
         }
         let due = due.map(|d| store::parse_due(d, Local::now().date_naive())).transpose()?;
-        let section = section.map(str::trim).filter(|s| !s.is_empty()).unwrap_or("Inbox");
+        let section = section.map(str::trim).filter(|s| !s.is_empty()).unwrap_or(store::DEFAULT_SECTION);
         let summary = self.store.update(|list| {
             let mut task = Task::new(list.next_id(), title.to_string());
             task.due = due;
@@ -588,7 +584,7 @@ impl App {
         let mut entry = LogEntry::new(kind, "");
         entry.changes.push(summary.to_string());
         self.log.append(&entry)?;
-        self.emit(Event::Changed { turn: 0, summary: summary.to_string() });
+        self.emit(Event::Changed { turn: None, summary: summary.to_string() });
         self.housekeeping();
         self.emit_status();
         Ok(())
@@ -600,10 +596,7 @@ impl App {
         let Some(line) = lines.next_line().await? else { return Ok(()) };
         let req: Request = match serde_json::from_str(&line) {
             Ok(r) => r,
-            Err(e) => {
-                write_event(&mut out, &Event::Error { turn: 0, text: format!("bad request: {e}") }).await?;
-                return write_event(&mut out, &Event::Done).await;
-            }
+            Err(e) => return answer(&mut out, Err(anyhow::anyhow!("bad request: {e}"))).await,
         };
         match req {
             Request::Subscribe { notifies } => {
@@ -621,108 +614,87 @@ impl App {
                     }
                 }
             }
-            Request::Status => {
-                write_event(&mut out, &Event::Status { status: self.status() }).await?;
-                write_event(&mut out, &Event::Done).await
-            }
-            Request::Tasks => {
-                self.housekeeping();
-                write_event(&mut out, &Event::Tasks { list: self.store.load()? }).await?;
-                write_event(&mut out, &Event::Done).await
-            }
-            Request::Say { text } => self.turn(&mut out, text, InputKind::Message).await,
-            Request::Start { text } => {
+            Request::Status => answer(&mut out, Ok(Event::Status { status: self.status() })).await,
+            Request::Tasks => answer(&mut out, self.store.load().map(|list| Event::Tasks { list })).await,
+            Request::Say { text } => self.turn(&mut out, text, InputKind::Message, None).await,
+            Request::Start { text: Some(text) } if !text.trim().is_empty() => {
                 self.resume_timers();
-                match text.filter(|t| !t.trim().is_empty()) {
-                    Some(text) => self.turn(&mut out, text, InputKind::Bootstrap).await,
-                    None => self.turn(&mut out, RESUME_PROMPT.into(), InputKind::Resume).await,
-                }
+                self.turn(&mut out, text, InputKind::Bootstrap, None).await
             }
-            Request::Resume => {
+            Request::Start { .. } | Request::Resume => {
                 self.resume_timers();
-                self.turn(&mut out, RESUME_PROMPT.into(), InputKind::Resume).await
+                self.turn(&mut out, RESUME_PROMPT.into(), InputKind::Resume, None).await
             }
             Request::Pause => {
                 self.pause();
-                let text = "Check-ins paused until your next message.".to_string();
-                write_event(&mut out, &Event::Ok { text }).await?;
-                write_event(&mut out, &Event::Done).await
+                answer(&mut out, Ok(Event::Ok { text: "Check-ins paused until your next message.".into() })).await
             }
-            Request::Next => self.turn(&mut out, "what's next?".into(), InputKind::Message).await,
-            Request::Add { url } => self.turn(&mut out, format!("{url} add to the list"), InputKind::Message).await,
+            Request::Next => self.turn(&mut out, "what's next?".into(), InputKind::Message, None).await,
+            Request::Add { url } => self.turn(&mut out, format!("{url} add to the list"), InputKind::Message, None).await,
             Request::New { title, section, due } => {
-                match self.add_task(&title, section.as_deref(), due.as_deref()) {
-                    Ok(summary) => write_event(&mut out, &Event::Changed { turn: 0, summary }).await?,
-                    Err(e) => write_event(&mut out, &Event::Error { turn: 0, text: format!("{e:#}") }).await?,
-                }
-                write_event(&mut out, &Event::Done).await
+                let added = self.add_task(&title, section.as_deref(), due.as_deref());
+                answer(&mut out, added.map(|summary| Event::Changed { turn: None, summary })).await
+            }
+            Request::Note { id, text } => {
+                answer(&mut out, self.add_note(&id, &text).map(|summary| Event::Changed { turn: None, summary })).await
+            }
+            Request::Toggle { id } => {
+                answer(&mut out, self.toggle(&id).map(|summary| Event::Changed { turn: None, summary })).await
             }
             Request::Approve { id } => match self.take_pending(&id) {
-                Ok(proposal) => {
-                    let text = format!("approve {}: {} to {}", proposal.id, proposal.kind, proposal.target);
-                    self.turn_approved(&mut out, text, InputKind::Approved, Some(proposal)).await
-                }
-                Err(e) => {
-                    write_event(&mut out, &Event::Error { turn: 0, text: format!("{e:#}") }).await?;
-                    write_event(&mut out, &Event::Done).await
-                }
+                Ok(p) => self.turn(&mut out, format!("approve {}", p.headline()), InputKind::Approved, Some(p)).await,
+                Err(e) => answer(&mut out, Err(e)).await,
             },
-            Request::Reject { id } => {
-                match self.take_pending(&id) {
-                    Ok(p) => {
-                        let mut entry = LogEntry::new("rejected", "");
-                        entry.changes.push(format!("rejected {}: {} to {}", p.id, p.kind, p.target));
-                        self.log.append(&entry)?;
-                        let text = format!("Dropped {}. Nothing was sent.", p.id);
-                        write_event(&mut out, &Event::Ok { text }).await?;
-                    }
-                    Err(e) => write_event(&mut out, &Event::Error { turn: 0, text: format!("{e:#}") }).await?,
-                }
-                write_event(&mut out, &Event::Done).await
-            }
+            Request::Reject { id } => answer(&mut out, self.reject(&id)).await,
             Request::Tool { turn, name, input } => {
                 let mut active = self.agent_ctx.lock().await;
                 let event = match active.as_mut().filter(|ctx| ctx.turn == turn) {
                     Some(ctx) => {
                         let call = ToolCall { id: String::new(), name, input };
                         let (content, is_error) = tools::execute(&self, ctx, &call).await;
-                        Event::ToolResult { content, is_error }
+                        Ok(Event::ToolResult { content, is_error })
                     }
-                    None => Event::Error { turn: 0, text: format!("turn {turn} isn't running") },
+                    None => Err(anyhow::anyhow!("turn {turn} isn't running")),
                 };
                 drop(active);
-                write_event(&mut out, &event).await?;
-                write_event(&mut out, &Event::Done).await
+                answer(&mut out, event).await
             }
             Request::CheckIn => {
-                if self.rt().paused {
-                    write_event(&mut out, &Event::Error { turn: 0, text: "Check-ins are paused; resume first.".into() }).await?;
+                let result = if self.rt().paused {
+                    Err(anyhow::anyhow!("Check-ins are paused; resume first."))
                 } else {
                     self.checkin().await;
-                    let text = self.rt().last_checkin.clone().unwrap_or_default();
-                    write_event(&mut out, &Event::Ok { text }).await?;
-                }
-                write_event(&mut out, &Event::Done).await
-            }
-            Request::Toggle { id } => {
-                match self.toggle(&id) {
-                    Ok(summary) => write_event(&mut out, &Event::Changed { turn: 0, summary }).await?,
-                    Err(e) => write_event(&mut out, &Event::Error { turn: 0, text: format!("{e:#}") }).await?,
-                }
-                write_event(&mut out, &Event::Done).await
+                    Ok(Event::Ok { text: self.rt().last_checkin.clone().unwrap_or_default() })
+                };
+                answer(&mut out, result).await
             }
             Request::Report => {
                 self.pause();
-                self.turn(&mut out, "end-of-day report".into(), InputKind::Report).await
+                self.turn(&mut out, "end-of-day report".into(), InputKind::Report, None).await
             }
             Request::Shutdown => {
-                write_event(&mut out, &Event::Ok { text: "Daemon stopping.".into() }).await?;
-                write_event(&mut out, &Event::Done).await?;
+                answer(&mut out, Ok(Event::Ok { text: "Daemon stopping.".into() })).await?;
                 self.shutdown.notify_one();
                 Ok(())
             }
         }
     }
+
+    /// Drops a proposed action without sending anything.
+    fn reject(&self, id: &ActionId) -> Result<Event> {
+        let p = self.take_pending(id)?;
+        let mut entry = LogEntry::new("rejected", "");
+        entry.changes.push(format!("rejected {}", p.headline()));
+        self.log.append(&entry)?;
+        Ok(Event::Ok { text: format!("Dropped {}. Nothing was sent.", p.id) })
+    }
+}
+
+/// A one-event answer to a request, then `Done`. Errors go back as `Event::Error`.
+async fn answer(out: &mut OwnedWriteHalf, result: Result<Event>) -> Result<()> {
+    let event = result.unwrap_or_else(|e| Event::error(format!("{e:#}")));
+    write_event(out, &event).await?;
+    write_event(out, &Event::Done).await
 }
 
 async fn write_event(out: &mut OwnedWriteHalf, event: &Event) -> Result<()> {
@@ -774,7 +746,7 @@ pub async fn run(paths: Paths) -> Result<()> {
     let app = Arc::new(App::new(paths)?);
     app.housekeeping();
     tokio::spawn(app.clone().scheduler());
-    tokio::spawn(app.clone().report_timer());
+    tokio::spawn(app.clone().daily_timer());
     loop {
         tokio::select! {
             accepted = listener.accept() => {

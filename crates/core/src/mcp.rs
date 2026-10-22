@@ -6,15 +6,15 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
 use crate::config::Paths;
-use crate::protocol::{Event, Request};
+use crate::protocol::{Event, Request, TurnId};
 use crate::{client, tools};
 
 /// Serves newline-delimited JSON-RPC on stdin and stdout until stdin closes.
-pub async fn serve_stdio(paths: Paths, turn: u64) -> Result<()> {
+pub async fn serve_stdio(paths: Paths, turn: TurnId) -> Result<()> {
     serve(&paths, turn, BufReader::new(tokio::io::stdin()), tokio::io::stdout()).await
 }
 
-pub async fn serve(paths: &Paths, turn: u64, input: impl AsyncBufRead + Unpin, mut out: impl AsyncWrite + Unpin) -> Result<()> {
+pub async fn serve(paths: &Paths, turn: TurnId, input: impl AsyncBufRead + Unpin, mut out: impl AsyncWrite + Unpin) -> Result<()> {
     let mut lines = input.lines();
     while let Some(line) = lines.next_line().await? {
         let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
@@ -32,7 +32,7 @@ pub async fn serve(paths: &Paths, turn: u64, input: impl AsyncBufRead + Unpin, m
     Ok(())
 }
 
-async fn handle(paths: &Paths, turn: u64, msg: &Value) -> Result<Value> {
+async fn handle(paths: &Paths, turn: TurnId, msg: &Value) -> Result<Value> {
     let params = &msg["params"];
     Ok(match msg["method"].as_str().unwrap_or_default() {
         "initialize" => json!({
@@ -59,7 +59,7 @@ async fn handle(paths: &Paths, turn: u64, msg: &Value) -> Result<Value> {
 }
 
 /// Runs one tool in the daemon, inside the turn that started this server.
-async fn call(paths: &Paths, turn: u64, name: String, input: Value) -> (String, bool) {
+async fn call(paths: &Paths, turn: TurnId, name: String, input: Value) -> (String, bool) {
     let mut answer = None;
     let sent = client::request(paths, Request::Tool { turn, name, input }, |ev| match ev {
         Event::ToolResult { content, is_error } => answer = Some((content, is_error)),

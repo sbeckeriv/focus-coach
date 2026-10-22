@@ -89,9 +89,7 @@ impl Log {
         let removed = entries.len() - keep.len();
         if removed > 0 {
             let text: String = keep.iter().map(|e| format!("\n{e}\n")).collect();
-            let tmp = self.path.with_extension("md.tmp");
-            std::fs::write(&tmp, text)?;
-            std::fs::rename(&tmp, &self.path)?;
+            crate::store::write_atomic(&self.path, &text)?;
         }
         Ok(removed)
     }
