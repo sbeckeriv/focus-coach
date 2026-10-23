@@ -25,13 +25,17 @@ impl Paint {
     fn green(&self, t: &str) -> String {
         self.wrap("2;32", t)
     }
+    fn cyan(&self, t: &str) -> String {
+        self.wrap("36", t)
+    }
 }
 
-/// Open work by section with the top item marked; done items only from today,
-/// held sections folded to one line.
+/// Open work by section with the active items marked (or, with none, the top item);
+/// done items only from today, held sections folded to one line.
 pub fn format(list: &TaskList, today: NaiveDate, color: bool) -> String {
     let p = Paint(color);
-    let top = list.top_open().map(|t| t.id.clone());
+    // The top item is only worth pointing at when nothing is marked active.
+    let top = list.active().is_empty().then(|| list.top_open().map(|t| t.id.clone())).flatten();
     let width = list
         .tasks()
         .filter(|(s, t)| !s.on_hold && t.is_visible(today))
@@ -63,6 +67,7 @@ pub fn format(list: &TaskList, today: NaiveDate, color: bool) -> String {
             let pad = width.saturating_sub(task.title.chars().count());
             let title = format!("{}{}", task.title, " ".repeat(pad));
             let (mark, title) = match task.state {
+                State::Open if task.active => (p.cyan("●"), p.cyan(&title)),
                 State::Open if is_top => (p.yellow("▶"), p.yellow(&title)),
                 State::Open => ("○".to_string(), title),
                 State::Done { .. } => (p.green("✓"), p.green(&title)),

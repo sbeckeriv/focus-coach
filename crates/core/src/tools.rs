@@ -42,6 +42,10 @@ pub fn definitions() -> Vec<Value> {
             "priority": {"type": "integer"},
             "note": {"type": "string", "description": "Adds a note; earlier notes are kept"},
         }), &["task_id"]),
+        tool("set_active", "Mark tasks as what the person is on now, or no longer on. Several can be active at once; a task stays active until turned off.", json!({
+            "task_ids": {"type": "array", "items": {"type": "string"}, "description": "Task ids, e.g. [\"t3\", \"t5\"]"},
+            "active": {"type": "boolean", "description": "true: on it now; false: stopped or switched away"},
+        }), &["task_ids", "active"]),
         tool("remove_task", "Remove a task that turned out not to be the person's or not real.", json!({
             "task_id": task_id,
             "reason": {"type": "string"},
@@ -60,7 +64,7 @@ pub fn definitions() -> Vec<Value> {
         tool("append_log", "Record one line in the day's log: what the person is on and what changed.", json!({
             "summary": {"type": "string"},
         }), &["summary"]),
-        tool("set_schedule", "Replace the one check-in schedule, until the daemon restarts (focus.toml's schedule then applies again), with a 5-field cron expression (minute hour day month weekday), e.g. \"7,27,47 9-17 * * 1-5\" for every 20 minutes during weekday work hours.", json!({
+        tool("set_schedule", "Replace the one check-in schedule, until the daemon restarts or the person edits the schedule in focus.toml (which then applies again), with a 5-field cron expression (minute hour day month weekday), e.g. \"7,27,47 9-17 * * 1-5\" for every 20 minutes during weekday work hours.", json!({
             "cron": {"type": "string"},
         }), &["cron"]),
         tool("pause_checkins", "Stop check-ins until the person's next message.", json!({}), &[]),
@@ -133,6 +137,7 @@ enum Call {
     CheckOff(CheckOff),
     AddTask(AddTask),
     EditTask(EditTask),
+    SetActive(SetActive),
     RemoveTask(RemoveTask),
     SetState(SetState),
     SplitTask(SplitTask),
@@ -158,6 +163,13 @@ struct CheckOff {
     task_id: TaskId,
     #[serde(default, deserialize_with = "opt_text")]
     note: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SetActive {
+    #[serde(deserialize_with = "task_ids")]
+    task_ids: Vec<TaskId>,
+    active: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -336,6 +348,15 @@ fn task_id<'de, D: Deserializer<'de>>(d: D) -> Result<TaskId, D::Error> {
     }
 }
 
+/// One task id or a list of them, in any form `task_id` takes.
+fn task_ids<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<TaskId>, D::Error> {
+    let items = match Value::deserialize(d)? {
+        Value::Array(items) => items,
+        one => vec![one],
+    };
+    items.into_iter().map(|v| task_id(v).map_err(D::Error::custom)).collect()
+}
+
 /// 1 is highest; numbers or numeric strings, capped at 9.
 fn opt_priority<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u8>, D::Error> {
     let n = match Value::deserialize(d)? {
@@ -435,6 +456,11 @@ async fn run(app: &Arc<App>, ctx: &mut TurnCtx, call: Call) -> Result<String> {
             record(app, ctx, format!("removed {id}: {} ({reason})", task.title));
             Ok(format!("removed {id}"))
         }
+        Call::SetActive(SetActive { task_ids, active }) => {
+            let summary = app.store.update(|list| list.set_active(&task_ids, active))?;
+            record(app, ctx, summary.clone());
+            Ok(summary)
+        }
         Call::SetState(SetState { target, state, reason }) => {
             let state = State::parse(&state, today, reason.clone())?;
             let change = app.store.update(|list| {
@@ -508,10 +534,10 @@ async fn run(app: &Arc<App>, ctx: &mut TurnCtx, call: Call) -> Result<String> {
         }
         Call::FetchUrl(FetchUrl { url }) => lookup::fetch_url(&url).await,
         Call::SearchSource(s) => {
-            lookup::search(&app.settings.sources, &s.source, s.query.as_deref().unwrap_or(""), &s.filters).await
+            lookup::search(&app.config().settings.sources, &s.source, s.query.as_deref().unwrap_or(""), &s.filters).await
         }
         Call::PrStatus(PrStatus { pr }) => lookup::pr_status(&pr).await,
-        Call::ReadRepo(r) => lookup::read_repo(&app.settings.sources, &r.path, r.query.as_deref()).await,
+        Call::ReadRepo(r) => lookup::read_repo(&app.config().settings.sources, &r.path, r.query.as_deref()).await,
         Call::AskUser(AskUser { question }) => {
             app.rt().pending_question = Some(question.clone());
             app.emit(Event::Question { turn: ctx.turn, text: question });
@@ -574,6 +600,7 @@ mod tests {
                 let value = match props[field]["type"].as_str() {
                     Some("array") => json!(["x"]),
                     Some("integer") => json!(1),
+                    Some("boolean") => json!(true),
                     Some("object") => json!({}),
                     _ => props[field]["enum"].get(0).cloned().unwrap_or(json!("t1")),
                 };
@@ -599,6 +626,10 @@ mod tests {
 
         let Ok(Call::CheckOff(c)) = serde_json::from_value::<Call>(json!({"name": "check_off", "input": {"task_id": 3}})) else { panic!() };
         assert_eq!(c.task_id, "t3", "a bare number names the task");
+        let Ok(Call::SetActive(s)) = serde_json::from_value::<Call>(json!({"name": "set_active", "input": {"task_ids": ["t3", 5], "active": true}})) else { panic!() };
+        assert_eq!((s.task_ids, s.active), (vec![TaskId::parse("t3"), TaskId::parse("t5")], true));
+        let Ok(Call::SetActive(s)) = serde_json::from_value::<Call>(json!({"name": "set_active", "input": {"task_ids": "t3", "active": false}})) else { panic!() };
+        assert_eq!(s.task_ids, vec![TaskId::parse("t3")], "a single id is a list of one");
         assert!(serde_json::from_value::<Call>(json!({"name": "launch_rockets", "input": {}})).is_err());
         assert!(serde_json::from_value::<Call>(json!({"name": "pause_checkins", "input": null})).is_ok());
     }

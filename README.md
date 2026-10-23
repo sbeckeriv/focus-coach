@@ -34,21 +34,24 @@ One daemon owns the single check-in schedule. Every front end talks to it over `
    - `progress_check`: what runs right before each check-in, to tick off finished work and add new work from your sources. Off when blank (the default). See [Examples](#examples).
    - `report_at`: the automatic end-of-day report, at `"end"` of work hours (the default), a time like `"17:30"`, or `"off"`.
    - `notifier`: `"desktop"` for macOS notifications, or `"terminal"`.
+   - `remind_after_minutes`: when an unanswered check-in is sent again, with a sound (default 5; 0 turns it off).
+   - `checkin_popover`: the menubar app opens its popover at each check-in, as well as notifying (default off).
    - `archive_after_days`: how long done items stay on the list before moving to `done.md` (default 1; 0 moves them right away).
    - `log_keep_days`: how much of `log.md` to keep (default 30; 0 keeps everything).
    - `recent_turns`, `recent_log_entries`, `report_lookback_days`, `late_checkin_minutes`: how much each turn and the report see, and how late a check-in may fire after the machine sleeps.
    - `[llm]`: the provider and models.
    - `[sources]`: `github_org` to scope PR searches, and `repos_root` so the coach can read your local code.
+   - `[me]`: who you are. Your name, the nicknames and handles people use for you, your GitHub login, Slack handle, email, and free-form `notes`. The coach sees it on every turn, so it can tell your PRs and mentions from other people's.
 
-   If the daemon was already running when you edited the file, restart it with `focus stop` and then any command.
+   Edits apply within a couple of seconds, even while the daemon runs.
 
 5. **Start the day:**
 
    ```sh
    focus start "look at my PRs and make a task list"
-   To start the daemon at login without the menubar app, run `focus autostart on` (`off` removes it). It installs a launch agent with your current PATH, so `gh` and `claude` are found.
-
    ```
+
+   To start the daemon at login without the menubar app, run `focus autostart on` (`off` removes it). It installs a launch agent with your current PATH, so `gh` and `claude` are found.
 
 6. **Optional: the menubar app.**
 
@@ -57,7 +60,7 @@ One daemon owns the single check-in schedule. Every front end talks to it over `
    cd crates/menubar && cargo tauri build
    ```
 
-   This builds `Focus Coach.app` under `target/release/bundle/macos/`. Drag it to Applications, then turn on **Start at login** in its menu to keep it always on. While it runs, check-ins arrive as its own notifications; clicking one opens the popover. The window resizes, and the bar between the tasks and the conversation drags; click a task's title for its notes and links, and to add a note. For a quick try without bundling, run `cargo run -p focus-menubar`. CI also builds the app; see [CI](#ci).
+   This builds `Focus Coach.app` under `target/release/bundle/macos/`. Drag it to Applications, then turn on **Start at login** in its menu to keep it always on. While a check-in waits on your reply, the menubar icon turns red. While it runs, check-ins arrive as its own notifications; they stay on screen until you answer or close them (switch to banners in System Settings → Notifications → Focus Coach if you'd rather they slid away); clicking one opens the popover, and its **Still on it** and **Done** buttons answer about what you're on (or the top task) without opening it. Messages show the time they were sent. Links in the conversation open in your browser. The window resizes, and the bar between the tasks and the conversation drags; click a task's title for its notes and links, and to add a note. For a quick try without bundling, run `cargo run -p focus-menubar`. CI also builds the app; see [CI](#ci).
 
    Apps launched from Finder don't see your shell's environment variables, such as `ANTHROPIC_API_KEY`. With the menubar app, use `ant auth login`, the `claude-code` provider, or a local model.
 
@@ -71,6 +74,7 @@ focus say "add a task: renew passport, due friday"
 focus add "renew passport" --due fri              # add a task instantly (--section, --due)
 focus add https://github.com/org/repo/pull/12      # fetch a link and file it, through the coach
 focus note t3 "waiting on legal"                   # add context to a task (notes accumulate)
+focus on t3 t5 | off t3                            # mark what you're on now; several can be active
 focus approve a1 | reject a1                       # outgoing actions the coach proposed
 focus tasks                                        # the list; --markdown prints tasks.md as stored
 focus checkin                                      # check in now (after the progress check)
@@ -80,9 +84,11 @@ focus autostart on | off                           # start the daemon at login
 
 Nothing goes out without your approval. When the coach wants to send a message, post a PR comment, save a draft or commit, it proposes the action with the exact text and an id like `a1`, then waits. `focus approve a1`, `/approve a1` in the TUI, or the Approve button in the menubar runs one more turn that does exactly that. `focus status` lists what's waiting. Notes to self ("remind me at 3") need no approval.
 
-In the terminal UI, type to talk to the coach. Slash commands map to the CLI: `/next`, `/pause`, `/resume`, `/report`, `/add <title or url>` (with `--due` and `--section`), `/note [id] <text>` (the selected task when there's no id), `/approve <id>`, `/reject <id>`, `/copy` and `/start [sources]`. `/quit`, `/exit`, or `exit` on its own closes it. Alt+Enter adds a line break, and pasted text keeps its lines. With the mouse:
-- **Click a task's mark** (○ ▶ ! ✓) to check it off or reopen it. This writes straight to the list, with no model call.
+In the terminal UI, type to talk to the coach. Slash commands map to the CLI: `/next`, `/pause`, `/resume`, `/report`, `/add <title or url>` (with `--due` and `--section`), `/note [id] <text>` (the selected task when there's no id), `/on [ids]` and `/off [ids]` (likewise), `/approve <id>`, `/reject <id>`, `/copy` and `/start [sources]`. `/quit`, `/exit`, or `exit` on its own closes it. Alt+Enter adds a line break, and pasted text keeps its lines. With the mouse:
+- **Click a task's mark** (○ ▶ ● ! ✓) to check it off or reopen it. This writes straight to the list, with no model call.
 - **Click a task's title** to see its notes and links. Then press Enter on an empty input to open its first link.
+- **Right-click a task** to mark it as what you're on (●), or to unmark it.
+- **Click a link** in the conversation to open it in your browser.
 - **Drag the border** between the panes to resize them (or press Alt+←/→).
 - **Scroll** either pane with the wheel; PageUp and PageDown scroll the conversation. Long titles and long input wrap.
 
@@ -92,7 +98,7 @@ Everything lives in `~/.focus` (override with `FOCUS_HOME`):
 - `tasks.md`: the task list. You can edit it by hand at any time. Items without an `{id=..}` get one on the next save.
 - `done.md`: finished tasks, moved out of `tasks.md` after `archive_after_days` and grouped by day, newest first.
 - `log.md`: the check-in log, trimmed to `log_keep_days`.
-- `focus.toml`: settings, written with defaults on first run.
+- `focus.toml`: settings, written with defaults on first run. Edits apply within a couple of seconds, no restart needed; if the file doesn't parse, the TUI and menubar say why and the previous settings stay. A changed `schedule` replaces one the coach set.
 - `state.json`: pause state, the schedule, actions awaiting approval, and the current Claude Code session.
 - `reports/`: end-of-day reports.
 
@@ -120,6 +126,13 @@ claude_code_tools = ["Bash", "Read", "Glob", "Grep", "WebFetch", "WebSearch", "m
 [sources]
 github_org = "my-org"
 repos_root = "~/src"
+
+[me]
+name = "Sam Kim"
+aliases = ["sam", "sk", "skim"]
+github = "skim"
+slack = "@sam (U012345)"
+notes = "I'm on the billing team and own the invoices service. Reviews for api-gateway are mine too."
 ```
 
 ### The progress check
@@ -184,12 +197,17 @@ Posted the comment on api#88.
 ```
 ⏰ What are you on? Top of the list: Review billing docs (t2).
 $ focus say "yup. trying option b."      # logged, no questions back
-$ focus say "on a prod incident"         # off-list: it asks once, add it or get back to t2?
+$ focus say "on a prod incident"         # off-list: it adds it and marks it as what you're on
+$ focus say "might look at the flaky test" # unclear: it asks once, add it or get back to t2?
 $ focus say "billing docs done, half of the lodash PRs cut"
   · done t2: Review billing docs
   · done t1: Cut half of the lodash PRs; left as t10: Cut the rest of the lodash PRs
 $ focus say "quiet until tomorrow"       # pauses check-ins until your next message
 ```
+
+### Working on more than one thing
+
+The top of the list is just the most important open item. What you're actually on is separate: mark any number of tasks **active** and check-ins ask about them instead ("Still Deploy (t3) and Review (t5)?"). Tell the coach ("on the deploy and the review", "switched off the review"), run `focus on t3 t5` / `focus off t5`, use `/on` and `/off` or right-click in the TUI, or hover a task in the menubar and press **On it**. A task stays active until you turn it off; in `tasks.md` it's a bare `active` in the `{..}`, so you can edit it by hand too. With one active task the check-in notification offers **Done** for it; with several, it offers **Still on it**, and you check things off in the popover.
 
 ## Models
 

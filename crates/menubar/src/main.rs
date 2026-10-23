@@ -4,20 +4,45 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use focus_core::store::TaskList;
-use focus_core::{Event, Paths, Request, Status, TaskId, client, daemon};
+use focus_core::store::{State, TaskList};
+use focus_core::{Event, Paths, Request, Settings, Status, TaskId, client, daemon};
 use tauri::image::Image;
 use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, Rect, WindowEvent, Wry};
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
-use tauri_plugin_notification::NotificationExt;
+use tauri_plugin_notification::{Action, ActionPerformed, ActionType, NotificationExt};
 
 const TRAY_ID: &str = "focus";
 
 /// When the popover last hid itself, so the tray click that caused the blur
 /// doesn't immediately reopen it.
 static LAST_HIDE_MS: AtomicU64 = AtomicU64::new(0);
+
+/// When a notification button was last pressed, so the app activation it causes
+/// doesn't open the popover.
+static LAST_BUTTON_MS: AtomicU64 = AtomicU64::new(0);
+
+/// The buttons on a check-in notification, and the actions they run. Done is only
+/// offered about a single task; with several active, checking off is for the popover.
+const CHECK_IN_BUTTONS: &str = "check-in";
+const CHECK_IN_STILL_ONLY: &str = "check-in-still";
+const STILL_ON_IT: &str = "still-on-it";
+const DONE: &str = "done";
+
+/// What a check-in's buttons are about, as of the daemon's last status: the active
+/// tasks, or the top one when none are. Each is its id and its "Title (t3)" label.
+struct CheckInAbout(std::sync::Mutex<Vec<(TaskId, String)>>);
+
+impl CheckInAbout {
+    fn of(status: &Status) -> Vec<(TaskId, String)> {
+        if status.active_ids.is_empty() {
+            status.top_id.clone().zip(status.top.clone()).into_iter().collect()
+        } else {
+            status.active_ids.iter().cloned().zip(status.active.iter().cloned()).collect()
+        }
+    }
+}
 
 struct StatusItem(MenuItem<Wry>);
 
@@ -55,6 +80,10 @@ fn control_request(action: &str, arg: Option<String>) -> Result<Request, String>
         "report" => Request::Report,
         "add" => Request::add(&need("a title or a URL")?, None, None),
         "toggle" => Request::Toggle { id: TaskId::parse(&need("a task id")?) },
+        "on" | "off" => Request::SetActive {
+            ids: need("task ids")?.split([' ', ',']).filter(|s| !s.is_empty()).map(TaskId::parse).collect(),
+            active: action == "on",
+        },
         "approve" => Request::Approve { id: need("an action id")?.as_str().into() },
         "reject" => Request::Reject { id: need("an action id")?.as_str().into() },
         "note" => {
@@ -74,10 +103,24 @@ async fn control(action: String, arg: Option<String>, paths: tauri::State<'_, Pa
     send(&paths, control_request(&action, arg)?).await
 }
 
+/// Opens a link from the popover in the default browser, not in the popover itself.
+#[tauri::command]
+fn open_url(url: String) -> Result<(), String> {
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err(format!("not a web link: {url}"));
+    }
+    std::process::Command::new("open").arg(&url).spawn().map_err(|e| format!("couldn't open {url}: {e}"))?;
+    Ok(())
+}
+
 #[tauri::command]
 async fn tasks(paths: tauri::State<'_, Paths>) -> Result<TaskList, String> {
+    task_list(&paths).await
+}
+
+async fn task_list(paths: &Paths) -> Result<TaskList, String> {
     let mut list = None;
-    client::request(&paths, Request::Tasks, |ev| {
+    client::request(paths, Request::Tasks, |ev| {
         if let Event::Tasks { list: l } = ev {
             list = Some(l);
         }
@@ -116,6 +159,35 @@ fn show_popover(app: &AppHandle, anchor: Option<Rect>) {
     let _ = win.set_focus();
 }
 
+/// Opens the popover whenever macOS activates the app, as a click on one of its
+/// notifications does. The app has no Dock icon, so nothing else activates it.
+#[cfg(target_os = "macos")]
+fn show_popover_on_activate(app: AppHandle) {
+    use objc2_app_kit::NSApplicationDidBecomeActiveNotification;
+    use objc2_foundation::NSNotificationCenter;
+
+    // A notification button activates the app too; give its handler a moment to say so.
+    let block = block2::RcBlock::new(move |_| {
+        let app = app.clone();
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            if now_ms().saturating_sub(LAST_BUTTON_MS.load(Ordering::Relaxed)) > 1000 {
+                show_popover(&app, None);
+            }
+        });
+    });
+    // SAFETY: a system constant; the observer lives as long as the app, so its token is leaked.
+    let token = unsafe {
+        NSNotificationCenter::defaultCenter().addObserverForName_object_queue_usingBlock(
+            Some(NSApplicationDidBecomeActiveNotification),
+            None,
+            None,
+            &block,
+        )
+    };
+    std::mem::forget(token);
+}
+
 fn toggle_popover(app: &AppHandle, anchor: Rect) {
     let Some(win) = app.get_webview_window("main") else { return };
     if win.is_visible().unwrap_or(false) {
@@ -125,12 +197,30 @@ fn toggle_popover(app: &AppHandle, anchor: Rect) {
     }
 }
 
-/// Text beside the menubar icon: paused, a check-in waiting on a reply, or nothing.
+/// The menubar icon: the template (black, tinted by macOS for light and dark bars), or
+/// red while a check-in waits on a reply. The bool remembers which one is showing.
+struct TrayIcons {
+    plain: Image<'static>,
+    waiting: Image<'static>,
+    showing_waiting: std::sync::Mutex<bool>,
+}
+
+impl TrayIcons {
+    fn new() -> tauri::Result<Self> {
+        let plain = Image::from_bytes(include_bytes!("../icons/tray.png"))?;
+        let mut rgba = plain.rgba().to_vec();
+        for px in rgba.as_chunks_mut::<4>().0 {
+            px[..3].copy_from_slice(&[0xFF, 0x3B, 0x30]); // systemRed; alpha keeps the shape
+        }
+        let waiting = Image::new_owned(rgba, plain.width(), plain.height());
+        Ok(Self { plain, waiting, showing_waiting: Default::default() })
+    }
+}
+
+/// Text beside the menubar icon: paused or nothing. A check-in waiting on a reply turns the icon red instead.
 fn tray_title(status: &Status) -> &'static str {
     if status.paused {
         "⏸"
-    } else if status.awaiting_reply {
-        "●"
     } else {
         ""
     }
@@ -140,19 +230,77 @@ fn apply_status(app: &AppHandle, status: &Status) {
     if let Some(tray) = app.tray_by_id(TRAY_ID) {
         let _ = tray.set_title(Some(tray_title(status)));
         let _ = tray.set_tooltip(Some(status.summary()));
+        if let Some(icons) = app.try_state::<TrayIcons>() {
+            let mut showing = icons.showing_waiting.lock().unwrap();
+            if *showing != status.awaiting_reply {
+                *showing = status.awaiting_reply;
+                let icon = if *showing { &icons.waiting } else { &icons.plain };
+                let _ = tray.set_icon(Some(icon.clone()));
+                let _ = tray.set_icon_as_template(!*showing);
+            }
+        }
     }
     if let Some(item) = app.try_state::<StatusItem>() {
         let _ = item.0.set_text(status.summary());
     }
+    if let Some(about) = app.try_state::<CheckInAbout>() {
+        *about.0.lock().unwrap() = CheckInAbout::of(status);
+    }
 }
 
 /// A native notification for a check-in or note, unless the popover is already in front.
-/// Clicking it opens the popover (see the `on_action` handler in `main`).
-fn notify(app: &AppHandle, text: &str) {
+/// Clicking it opens the popover. A check-in also gets "Still on it" about the active
+/// tasks (or the top one), and "Done" when that's a single task (see `on_notification_action`).
+/// A reminder about an unanswered check-in also plays a sound.
+fn notify(app: &AppHandle, text: &str, check_in: bool, reminder: bool) {
     let in_front = app.get_webview_window("main").is_some_and(|w| w.is_visible().unwrap_or(false));
-    if !in_front {
-        let _ = app.notification().builder().title("Focus Coach").body(text).show();
+    if in_front {
+        return;
     }
+    let mut builder = app.notification().builder().title("Focus Coach").body(text);
+    if reminder {
+        builder = builder.sound("Glass");
+    }
+    let about = app.try_state::<CheckInAbout>().map(|a| a.0.lock().unwrap().clone()).unwrap_or_default();
+    if check_in && !about.is_empty() {
+        let buttons = if about.len() == 1 { CHECK_IN_BUTTONS } else { CHECK_IN_STILL_ONLY };
+        let ids: Vec<&str> = about.iter().map(|(id, _)| id.as_str()).collect();
+        let labels: Vec<&str> = about.iter().map(|(_, label)| label.as_str()).collect();
+        builder = builder.action_type_id(buttons).extra("tasks", ids.join(" ")).extra("labels", labels.join(", "));
+    }
+    let _ = builder.show();
+}
+
+/// What a check-in button asks the daemon, about the tasks named in the notification:
+/// their ids, space-separated, and their labels.
+fn button_request(action: &str, tasks: &str, labels: &str) -> Option<Request> {
+    match (action, &tasks.split_whitespace().collect::<Vec<_>>()[..]) {
+        (STILL_ON_IT, _) => Some(Request::Say { text: format!("Still on it: {labels}") }),
+        (DONE, [one]) => Some(Request::Toggle { id: TaskId::parse(one) }),
+        _ => None,
+    }
+}
+
+fn on_notification_action(app: &AppHandle, performed: &ActionPerformed) {
+    let extra = |key| performed.notification().and_then(|n| n.extra().get(key)?.as_str().map(String::from));
+    let (Some(tasks), Some(labels)) = (extra("tasks"), extra("labels")) else {
+        return show_popover(app, None);
+    };
+    let Some(req) = button_request(performed.action_id(), &tasks, &labels) else {
+        return show_popover(app, None);
+    };
+    LAST_BUTTON_MS.store(now_ms(), Ordering::Relaxed);
+    let (app, paths) = (app.clone(), app.state::<Paths>().inner().clone());
+    tauri::async_runtime::spawn(async move {
+        // Toggling reopens a done task, so Done only checks off one that's still open.
+        if let Request::Toggle { id } = &req
+            && let Ok(list) = task_list(&paths).await
+            && list.get(id.as_str()).is_ok_and(|t| !matches!(t.state, State::Open))
+        {
+            return;
+        }
+        run_request(&app, &paths, req).await;
+    });
 }
 
 /// Forwards every daemon event to the window, keeps the tray in sync, and shows
@@ -164,7 +312,14 @@ async fn subscribe_loop(app: AppHandle, paths: Paths) {
             while let Ok(Some(ev)) = sub.next().await {
                 match &ev {
                     Event::Status { status } => apply_status(&app, status),
-                    Event::CheckIn { text } | Event::Note { text } => notify(&app, text),
+                    Event::CheckIn { text, reminder } => {
+                        notify(&app, text, true, *reminder);
+                        // Read each time, so a focus.toml edit applies without a restart.
+                        if Settings::load(&paths).is_ok_and(|s| s.checkin_popover) {
+                            show_popover(&app, None);
+                        }
+                    }
+                    Event::Note { text } => notify(&app, text, false, false),
                     _ => {}
                 }
                 let _ = app.emit("focus-event", &ev);
@@ -191,16 +346,19 @@ fn menu_action(app: &AppHandle, id: &str) {
         show_popover(app, None);
     }
     let app = app.clone();
-    tauri::async_runtime::spawn(async move {
-        match send(&paths, req).await {
-            Ok(events) => events.iter().for_each(|ev| {
-                let _ = app.emit("focus-event", ev);
-            }),
-            Err(text) => {
-                let _ = app.emit("focus-event", Event::error(text));
-            }
+    tauri::async_runtime::spawn(async move { run_request(&app, &paths, req).await });
+}
+
+/// Sends a request from outside the popover and shows its direct answer there.
+async fn run_request(app: &AppHandle, paths: &Paths, req: Request) {
+    match send(paths, req).await {
+        Ok(events) => events.iter().for_each(|ev| {
+            let _ = app.emit("focus-event", ev);
+        }),
+        Err(text) => {
+            let _ = app.emit("focus-event", Event::error(text));
         }
-    });
+    }
 }
 
 /// The "Start at login" menu item: a launch agent for this app.
@@ -236,7 +394,7 @@ fn main() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_autostart::Builder::new().macos_launcher(MacosLauncher::LaunchAgent).build())
         .manage(paths.clone())
-        .invoke_handler(tauri::generate_handler![say, control, tasks, status])
+        .invoke_handler(tauri::generate_handler![say, control, tasks, status, open_url])
         .setup(move |app| {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
@@ -251,9 +409,21 @@ fn main() {
             });
             tauri::async_runtime::spawn(subscribe_loop(app.handle().clone(), paths.clone()));
 
-            // A click on a check-in notification opens the popover.
+            // A click on a check-in notification opens the popover, and its buttons answer
+            // it. The plugin reports a click only while the banner is up; one in
+            // Notification Center later just activates the app, so activation opens the
+            // popover too.
+            app.manage(CheckInAbout(Default::default()));
+            app.notification().register_action_types(vec![
+                ActionType::builder(CHECK_IN_BUTTONS)
+                    .actions(vec![Action::builder(STILL_ON_IT, "Still on it").build(), Action::builder(DONE, "Done").build()])
+                    .build(),
+                ActionType::builder(CHECK_IN_STILL_ONLY).actions(vec![Action::builder(STILL_ON_IT, "Still on it").build()]).build(),
+            ])?;
             let handle = app.handle().clone();
-            app.notification().on_action(move |_| show_popover(&handle, None))?;
+            app.notification().on_action(move |performed| on_notification_action(&handle, performed))?;
+            #[cfg(target_os = "macos")]
+            show_popover_on_activate(app.handle().clone());
 
             let status_item = MenuItem::with_id(app, "status", "Starting…", false, None::<&str>)?;
             let login_on = app.autolaunch().is_enabled().unwrap_or(false);
@@ -276,9 +446,12 @@ fn main() {
             )?;
             app.manage(StatusItem(status_item));
             app.manage(LoginItem(login_item));
+            let icons = TrayIcons::new()?;
+            let plain = icons.plain.clone();
+            app.manage(icons);
 
             TrayIconBuilder::with_id(TRAY_ID)
-                .icon(Image::from_bytes(include_bytes!("../icons/tray.png"))?)
+                .icon(plain)
                 .icon_as_template(true)
                 .tooltip("Focus Coach")
                 .menu(&menu)
@@ -327,6 +500,8 @@ mod tests {
             busy: false,
             top: None,
             top_id: None,
+            active: vec![],
+            active_ids: vec![],
             open: 0,
             session: None,
             pending: vec![],
@@ -336,7 +511,7 @@ mod tests {
     #[test]
     fn tray_title_reflects_state() {
         assert_eq!(tray_title(&status(true, true)), "⏸", "paused wins");
-        assert_eq!(tray_title(&status(false, true)), "●");
+        assert_eq!(tray_title(&status(false, true)), "", "a waiting reply turns the icon red instead");
         assert_eq!(tray_title(&status(false, false)), "");
     }
 
@@ -354,10 +529,30 @@ mod tests {
         assert!(matches!(control_request("approve", Some("a1".into())), Ok(Request::Approve { id }) if id == "a1"));
         assert!(matches!(control_request("reject", Some("a1".into())), Ok(Request::Reject { id }) if id == "a1"));
         assert!(control_request("toggle", None).is_err());
+        assert!(matches!(control_request("on", Some("t3 5".into())), Ok(Request::SetActive { ids, active: true }) if ids == ["t3", "t5"]));
+        assert!(matches!(control_request("off", Some("t3".into())), Ok(Request::SetActive { active: false, .. })));
+        assert!(control_request("on", None).is_err());
         assert!(matches!(control_request("note", Some("3 waiting on legal".into())), Ok(Request::Note { id, text }) if id == "t3" && text == "waiting on legal"));
         assert!(control_request("note", Some("t3".into())).is_err(), "a note needs text");
         assert!(matches!(control_request("start", Some("my PRs".into())), Ok(Request::Start { text: Some(_) })));
         assert!(control_request("explode", None).is_err());
+    }
+
+    #[test]
+    fn check_in_buttons_answer_about_the_top_task() {
+        assert!(matches!(button_request(STILL_ON_IT, "t3", "Review configs (t3)"),
+            Some(Request::Say { text }) if text == "Still on it: Review configs (t3)"));
+        assert!(matches!(button_request(DONE, "t3", "Review configs (t3)"), Some(Request::Toggle { id }) if id == "t3"));
+        assert!(button_request("tap", "t3", "Review configs (t3)").is_none(), "a click on the body opens the popover");
+        assert!(matches!(button_request(STILL_ON_IT, "t3 t5", "Deploy (t3), Docs (t5)"),
+            Some(Request::Say { text }) if text == "Still on it: Deploy (t3), Docs (t5)"));
+        assert!(button_request(DONE, "t3 t5", "Deploy (t3), Docs (t5)").is_none(), "Done is only about one task");
+
+        let mut s = status(false, false);
+        (s.top_id, s.top) = (Some("t1".into()), Some("Ship (t1)".into()));
+        assert_eq!(CheckInAbout::of(&s), vec![("t1".into(), "Ship (t1)".into())], "no active tasks: the top one");
+        (s.active_ids, s.active) = (vec!["t3".into(), "t5".into()], vec!["Deploy (t3)".into(), "Docs (t5)".into()]);
+        assert_eq!(CheckInAbout::of(&s).len(), 2, "the active tasks, not the top one");
     }
 
     /// The popover gets direct answers from `send` and turn events only through the

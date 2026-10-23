@@ -16,9 +16,71 @@ function el(tag, cls, text) {
   return node;
 }
 
+// Web links in text, ending before whitespace or quotes; trailing punctuation and an
+// unmatched closing bracket belong to the sentence, not the link.
+const URL_RE = /https?:\/\/[^\s<>"'`]+/g;
+
+function trimUrl(url) {
+  for (;;) {
+    const last = url.at(-1);
+    const open = { ")": "(", "]": "[", "}": "{" }[last];
+    if (".,;:!?*_'\"".includes(last)) url = url.slice(0, -1);
+    else if (open && url.split(open).length < url.split(last).length) url = url.slice(0, -1);
+    else return url;
+  }
+}
+
+/// `text` with its web links clickable; they open in the browser, not the popover.
+function linkify(text) {
+  const frag = document.createDocumentFragment();
+  let at = 0;
+  for (const match of text.matchAll(URL_RE)) {
+    const url = trimUrl(match[0]);
+    frag.append(text.slice(at, match.index));
+    const a = el("a", "", url);
+    a.href = url;
+    a.title = url;
+    a.addEventListener("click", (e) => {
+      e.preventDefault();
+      invoke("open_url", { url }).catch((err) => push("error", String(err)));
+    });
+    frag.append(a);
+    at = match.index + url.length;
+  }
+  frag.append(text.slice(at));
+  return frag;
+}
+
+// "14:07" today, "Tue 14:07" on an earlier day.
+function stamp(date) {
+  const time = date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  if (date.toDateString() === new Date().toDateString()) return time;
+  return `${date.toLocaleDateString([], { weekday: "short" })} ${time}`;
+}
+
+/// Labels each message with when it arrived, blank when it's the same as the one
+/// above. Rerun as time passes, so "today" stays right.
+function renderTimes() {
+  let last = "";
+  for (const node of feed.querySelectorAll(".msg > time")) {
+    const label = stamp(new Date(node.dateTime));
+    node.textContent = label === last ? "" : label;
+    last = label;
+  }
+}
+
 function push(cls, text) {
-  const node = el("div", `msg ${cls}`, text);
+  const node = el("div", `msg ${cls}`);
+  if (cls !== "thinking") {
+    const now = new Date();
+    const time = el("time");
+    time.dateTime = now.toISOString();
+    time.title = now.toLocaleString();
+    node.appendChild(time);
+  }
+  node.append(linkify(text));
   feed.appendChild(node);
+  renderTimes();
   feed.scrollTop = feed.scrollHeight;
   return node;
 }
@@ -39,18 +101,21 @@ function renderStatus(s) {
   topId = s.top_id;
   const status = $("status");
   status.classList.toggle("paused", s.paused);
-  status.textContent = summarize(s);
+  [status.textContent, $("counts").textContent] = summarize(s);
   $("toggle").textContent = s.paused ? "Resume" : "Pause";
 }
 
+/// Two lines: when the next check-in is, then what you're on and what's open.
 function summarize(s) {
   const timer = s.paused
     ? "paused until your next message"
     : s.next_checkin
-      ? `next check-in ${new Date(s.next_checkin).toLocaleTimeString([], { weekday: "short", hour: "2-digit", minute: "2-digit" })}`
+      ? `next check-in ${stamp(new Date(s.next_checkin))}`
       : "no upcoming check-in";
   const approvals = s.pending?.length ? ` · ${s.pending.length} awaiting approval` : "";
-  return `${s.open} open · ${timer}${s.awaiting_reply ? " · waiting on your reply" : ""}${approvals}`;
+  const on = s.active_ids?.length ? ` · on ${s.active_ids.join(", ")}` : "";
+  const counts = `${s.open} open${on}${approvals}`;
+  return [`${timer}${s.awaiting_reply ? " · waiting on your reply" : ""}`, counts];
 }
 
 const MARKS = { open: "○", done: "✓", on_hold: "‖", blocked: "!" };
@@ -61,8 +126,8 @@ let openTask = null;
 /// Notes, links and a box to add a note, under a clicked task.
 function details(task) {
   const box = el("div", "details");
-  for (const note of task.notes ?? []) box.appendChild(el("p", "", `note: ${note}`));
-  for (const link of task.links ?? []) box.appendChild(el("p", "muted", link));
+  for (const note of task.notes ?? []) box.appendChild(el("p")).append(linkify(`note: ${note}`));
+  for (const link of task.links ?? []) box.appendChild(el("p", "muted")).append(linkify(link));
   if (task.blocked_by) box.appendChild(el("p", "muted", `blocked by ${task.blocked_by}`));
   const add = el("input");
   add.placeholder = "Add a note…";
@@ -79,7 +144,9 @@ function renderTasks(list) {
   const root = $("tasks");
   root.replaceChildren();
   const today = new Date().toLocaleDateString("en-CA");
-  const top = topId;
+  // The top item is only worth pointing at when nothing is marked active.
+  const anyActive = list.sections.some((s) => !s.on_hold && s.tasks.some((t) => t.active && t.state !== "done"));
+  const top = anyActive ? null : topId;
   for (const section of list.sections) {
     const visible = section.tasks.filter((t) => t.state !== "done" || t.done_on === today);
     if (!visible.length && !section.on_hold) continue;
@@ -87,8 +154,9 @@ function renderTasks(list) {
     box.appendChild(el("h3", "", section.on_hold ? `${section.name} · on hold` : section.name));
     if (!section.on_hold) {
       for (const task of visible) {
-        const row = el("div", `task ${task.state}${task.id === top ? " top" : ""}`);
-        const mark = el("button", "mark", task.id === top ? "▶" : MARKS[task.state]);
+        const active = task.active && task.state === "open";
+        const row = el("div", `task ${task.state}${task.id === top ? " top" : ""}${active ? " active" : ""}`);
+        const mark = el("button", "mark", active ? "●" : task.id === top ? "▶" : MARKS[task.state]);
         mark.type = "button";
         mark.title = task.state === "done" ? "Reopen" : "Check off";
         mark.addEventListener("click", () => run(invoke("control", { action: "toggle", arg: task.id })));
@@ -100,6 +168,15 @@ function renderTasks(list) {
           renderTasks(list);
         });
         row.appendChild(name);
+        if (task.state !== "done") {
+          const on = el("button", "on", task.active ? "Stop" : "On it");
+          on.type = "button";
+          on.title = task.active ? "No longer on this" : "Mark as what you're on now; several can be";
+          on.addEventListener("click", () =>
+            run(invoke("control", { action: task.active ? "off" : "on", arg: task.id })),
+          );
+          row.appendChild(on);
+        }
         if (task.notes?.length) row.appendChild(el("span", "notes", "✎"));
         if (task.due) row.appendChild(el("span", "due", `due ${task.due.slice(5)}`));
         row.appendChild(el("span", "id", task.id));
@@ -130,7 +207,7 @@ function onEvent(ev) {
       const p = ev.proposal;
       const node = push("preview proposal", "");
       node.appendChild(el("span", "label", `${p.id} · ${p.kind} to ${p.target} · awaiting approval`));
-      node.appendChild(document.createTextNode(p.content));
+      node.append(linkify(p.content));
       const buttons = el("div", "choices");
       for (const [action, label] of [["approve", "Approve"], ["reject", "Reject"]]) {
         const b = el("button", action, label);
@@ -149,7 +226,7 @@ function onEvent(ev) {
     case "preview": {
       const node = push("preview", "");
       node.appendChild(el("span", "label", `${ev.kind} · preview, not sent`));
-      node.appendChild(document.createTextNode(ev.content));
+      node.append(linkify(ev.content));
       break;
     }
     case "changed": push("change", `· ${ev.summary}`); refreshTasks(); break;
@@ -180,8 +257,11 @@ function slash(text) {
   const actions = {
     "/next": "next", "/pause": "pause", "/resume": "resume", "/report": "report",
     "/add": "add", "/start": "start", "/approve": "approve", "/reject": "reject", "/note": "note",
+    "/on": "on", "/off": "off",
   };
-  return actions[cmd] ? { action: actions[cmd], arg } : null;
+  // /on and /off alone mean the task whose details are open.
+  const fallback = actions[cmd] === "on" || actions[cmd] === "off" ? openTask : null;
+  return actions[cmd] ? { action: actions[cmd], arg: arg ?? fallback } : null;
 }
 
 $("composer").addEventListener("submit", (e) => {
@@ -249,3 +329,4 @@ window.addEventListener("focus", () => {
 invoke("status").then(renderStatus).catch(() => {});
 refreshTasks();
 setInterval(refreshTasks, 10000);
+setInterval(renderTimes, 60000);

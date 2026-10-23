@@ -89,6 +89,10 @@ pub struct Task {
     pub due: Option<NaiveDate>,
     /// Context, oldest first: one `- note:` line each.
     pub notes: Vec<String>,
+    /// Being worked on now; any number can be. Written `active` in the `{..}`, and
+    /// stays until turned off.
+    #[serde(default)]
+    pub active: bool,
     pub source_ref: Option<String>,
     /// Indented lines under the item that aren't fields; kept verbatim.
     #[serde(skip)]
@@ -106,6 +110,7 @@ impl Task {
             due: None,
             notes: Vec::new(),
             source_ref: None,
+            active: false,
             extra: Vec::new(),
         }
     }
@@ -402,6 +407,31 @@ impl TaskList {
             .min_by_key(|(si, ti, t)| (t.priority.unwrap_or(u8::MAX), *si, *ti))
             .map(|(_, _, t)| t)
     }
+
+    /// What the person is on now, in list order: active items that aren't done, outside
+    /// held sections. A done item keeps its flag, so reopening it makes it active again.
+    pub fn active(&self) -> Vec<&Task> {
+        self.tasks().filter(|(s, t)| !s.on_hold && t.active && !t.is_done()).map(|(_, t)| t).collect()
+    }
+
+    /// Turns `active` on or off for each of `ids`; all must exist. Returns a summary.
+    pub fn set_active(&mut self, ids: &[TaskId], active: bool) -> Result<String> {
+        if ids.is_empty() {
+            bail!("name at least one task");
+        }
+        for id in ids {
+            self.get(id.as_str())?;
+        }
+        let labels: Vec<String> = ids
+            .iter()
+            .map(|id| {
+                let task = self.get_mut(id.as_str()).expect("checked above");
+                task.active = active;
+                task.label()
+            })
+            .collect();
+        Ok(format!("{} {}", if active { "on" } else { "off" }, labels.join(", ")))
+    }
 }
 
 /// A due date as people type it: YYYY-MM-DD, "today", "tomorrow", or a weekday name
@@ -507,6 +537,10 @@ fn parse_task_line(line: &str) -> Option<Task> {
     let mut task = Task::new(TaskId::unset(), title.trim().to_string());
     task.state = state;
     for pair in meta.unwrap_or("").split_whitespace() {
+        if pair == "active" {
+            task.active = true;
+            continue;
+        }
         let Some((key, value)) = pair.split_once('=') else { continue };
         match key {
             "id" => task.id = TaskId::parse(value),
@@ -554,6 +588,9 @@ fn render_task(out: &mut String, task: &Task) {
     }
     if let Some(d) = task.done_on() {
         meta.push_str(&format!(" done={d}"));
+    }
+    if task.active {
+        meta.push_str(" active");
     }
     out.push_str(&format!("- [{}] {} {{{meta}}}\n", task.state.marker(), task.title));
     for link in &task.links {
@@ -799,6 +836,20 @@ mod tests {
     fn top_open_skips_held_sections_and_non_open() {
         let list = TaskList::parse(SAMPLE);
         assert_eq!(list.top_open().unwrap().title, "written by hand");
+    }
+
+    #[test]
+    fn several_tasks_can_be_active_until_turned_off() {
+        let mut list = TaskList::parse("## Today\n- [ ] Deploy {id=t1 active}\n- [ ] Review {id=t2}\n- [x] Old {id=t3 active}\n");
+        assert_eq!(list.active().iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["t1"], "done items aren't active");
+        assert_eq!(list.set_active(&["t2".into()], true).unwrap(), "on Review (t2)");
+        assert_eq!(list.active().len(), 2);
+        assert!(list.render().contains("- [ ] Review {id=t2 active}"), "{}", list.render());
+        assert!(list.set_active(&["t1".into(), "t9".into()], false).is_err(), "an unknown id changes nothing");
+        assert!(list.get("t1").unwrap().active);
+        list.set_active(&["t1".into()], false).unwrap();
+        assert_eq!(list.active().iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["t2"]);
+        assert_eq!(TaskList::parse(&list.render()).render(), list.render());
     }
 
     #[test]

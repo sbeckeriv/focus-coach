@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Local, NaiveDate, NaiveTime};
@@ -25,13 +25,29 @@ use crate::store::{self, Store, Task, TaskId};
 use crate::{report, tools};
 
 const RESUME_PROMPT: &str = "I'm back. Summarize where things stand.";
+/// How often focus.toml is checked for edits.
+const CONFIG_POLL: Duration = Duration::from_secs(2);
+
+/// A file's modification time, or `None` when it can't be read.
+fn modified(path: &std::path::Path) -> Option<SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
 /// An automatic report this long after its time is skipped (the machine was asleep).
 const REPORT_GRACE: chrono::Duration = chrono::Duration::hours(3);
 
+/// focus.toml as last read, and the model client built from its `[llm]`. Swapped whole
+/// when the file changes, so a turn keeps the one it started with.
+pub(crate) struct Config {
+    pub settings: Settings,
+    pub provider: Arc<Provider>,
+}
+
 pub struct App {
     pub(crate) paths: Paths,
-    pub(crate) settings: Settings,
-    pub(crate) provider: Provider,
+    config: std::sync::RwLock<Arc<Config>>,
+    /// focus.toml's modification time when it was last read, to notice edits.
+    config_stamp: Mutex<Option<SystemTime>>,
     pub(crate) store: Store,
     pub(crate) log: Log,
     runtime: Mutex<Runtime>,
@@ -52,8 +68,9 @@ pub struct App {
 #[serde(default)]
 pub(crate) struct Runtime {
     pub paused: bool,
-    /// The one check-in schedule. Starts as focus.toml's on every start, so the config
-    /// always wins; a turn can change it until the next restart. Not saved.
+    /// The one check-in schedule. Starts as focus.toml's on every start and is replaced
+    /// when the file's schedule is edited, so the config always wins; a turn can change it
+    /// in between. Not saved.
     #[serde(skip)]
     pub schedule: Option<Cron>,
     pub session: Option<ClaudeSession>,
@@ -70,6 +87,9 @@ pub(crate) struct Runtime {
     pub missed: u32,
     #[serde(skip)]
     pub last_checkin: Option<String>,
+    /// Counts check-ins, so a reminder can tell its check-in is still the latest.
+    #[serde(skip)]
+    checkin_seq: u64,
     #[serde(skip)]
     pub pending_question: Option<String>,
     /// Recent (input, reply) pairs, oldest first.
@@ -97,8 +117,9 @@ impl Drop for NotifierGuard<'_> {
 
 impl App {
     fn new(paths: Paths) -> Result<Self> {
+        let config_stamp = modified(&paths.config());
         let settings = Settings::load(&paths)?;
-        let provider = Provider::from_settings(&settings.llm)?;
+        let provider = Arc::new(Provider::from_settings(&settings.llm)?);
         let mut runtime: Runtime = std::fs::read_to_string(paths.state())
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
@@ -108,8 +129,8 @@ impl App {
             store: Store::new(&paths.tasks()).with_archive(&paths.done()),
             log: Log::new(&paths.log()),
             paths,
-            settings,
-            provider,
+            config: std::sync::RwLock::new(Arc::new(Config { settings, provider })),
+            config_stamp: Mutex::new(config_stamp),
             runtime: Mutex::new(runtime),
             events: broadcast::channel(256).0,
             rearm: watch::channel(0).0,
@@ -119,6 +140,69 @@ impl App {
             notifiers: AtomicUsize::new(0),
             shutdown: Notify::new(),
         })
+    }
+
+    /// The current settings and model client. Take it once per job, so the whole job
+    /// sees one version even if focus.toml changes meanwhile.
+    pub(crate) fn config(&self) -> Arc<Config> {
+        self.config.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Rereads focus.toml if it changed since it was last read. A new schedule replaces
+    /// the current one (even one a turn set), and the model client is rebuilt only when
+    /// `[llm]` changed. A file that doesn't parse leaves everything as it was and says so,
+    /// once per edit.
+    fn reload_config(&self) {
+        let stamp = modified(&self.paths.config());
+        {
+            let mut seen = self.config_stamp.lock().unwrap_or_else(|e| e.into_inner());
+            if *seen == stamp {
+                return;
+            }
+            *seen = stamp;
+        }
+        let old = self.config();
+        let result = Settings::load(&self.paths).and_then(|settings| {
+            let provider = if settings.llm == old.settings.llm {
+                old.provider.clone()
+            } else {
+                Arc::new(Provider::from_settings(&settings.llm)?)
+            };
+            Ok(Config { settings, provider })
+        });
+        let config = match result {
+            Ok(config) => config,
+            Err(e) => {
+                self.emit(Event::error(format!("{e:#}. Keeping the previous settings until it's fixed.")));
+                return;
+            }
+        };
+        let schedule_changed = config.settings.schedule.to_string() != old.settings.schedule.to_string();
+        if schedule_changed {
+            self.rt().schedule = Some(config.settings.schedule.clone());
+        }
+        let llm_changed = !Arc::ptr_eq(&config.provider, &old.provider);
+        *self.config.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(config);
+        // Work hours and the lateness window feed the next check-in too.
+        self.rearm.send_modify(|g| *g += 1);
+        let mut summary = "reloaded focus.toml".to_string();
+        if schedule_changed {
+            summary.push_str(&format!("; schedule now {}", self.config().settings.schedule));
+        }
+        if llm_changed {
+            summary.push_str("; new model settings");
+        }
+        if let Err(e) = self.changed_by_hand("config", &summary) {
+            self.emit(Event::error(format!("{e:#}")));
+        }
+    }
+
+    /// Checks focus.toml for edits every couple of seconds.
+    async fn config_watcher(self: Arc<Self>) {
+        loop {
+            tokio::time::sleep(CONFIG_POLL).await;
+            self.reload_config();
+        }
     }
 
     pub(crate) fn rt(&self) -> MutexGuard<'_, Runtime> {
@@ -144,8 +228,10 @@ impl App {
             busy: self.turn_lock.try_lock().is_err(),
             top: top.map(Task::label),
             top_id: top.map(|t| t.id.clone()),
+            active: list.active().into_iter().map(Task::label).collect(),
+            active_ids: list.active().into_iter().map(|t| t.id.clone()).collect(),
             open: list.open_count(),
-            session: matches!(self.provider, Provider::ClaudeCode(_))
+            session: matches!(*self.config().provider, Provider::ClaudeCode(_))
                 .then(|| rt.session.as_ref().map(|s| s.id.clone()))
                 .flatten(),
             pending: rt.pending.clone(),
@@ -155,7 +241,7 @@ impl App {
     /// The session for this claude-code turn: the configured one, or today's.
     pub(crate) fn claude_session(&self) -> ClaudeSession {
         let today = Local::now().date_naive();
-        let fixed = self.settings.llm.session_id.clone();
+        let fixed = self.config().settings.llm.session_id.clone();
         let mut rt = self.rt();
         let current = rt.session.as_ref().is_some_and(|s| match &fixed {
             Some(id) => &s.id == id,
@@ -222,7 +308,7 @@ impl App {
 
     /// The current schedule.
     fn schedule_of(&self, rt: &Runtime) -> Cron {
-        rt.schedule.clone().unwrap_or_else(|| self.settings.schedule.clone())
+        rt.schedule.clone().unwrap_or_else(|| self.config().settings.schedule.clone())
     }
 
     /// Records an outgoing action for the person to approve.
@@ -265,14 +351,14 @@ impl App {
 
     /// The daemon's own notification, unless a subscriber (the menubar app) shows them.
     async fn notify_desktop(&self, text: &str) {
-        if self.settings.notifier == Notifier::Desktop && self.notifiers.load(Ordering::Relaxed) == 0 {
+        if self.config().settings.notifier == Notifier::Desktop && self.notifiers.load(Ordering::Relaxed) == 0 {
             notify_desktop(text).await;
         }
     }
 
     /// Whether today's morning bootstrap still has to run.
     fn morning_due(&self) -> bool {
-        !self.settings.morning_bootstrap.trim().is_empty()
+        !self.config().settings.morning_bootstrap.trim().is_empty()
             && self.rt().last_bootstrap != Some(Local::now().date_naive())
     }
 
@@ -282,7 +368,7 @@ impl App {
         // A year ahead is plenty to find one inside work hours, or to show there's none.
         let horizon = after + chrono::Duration::days(366);
         while t <= horizon {
-            if self.settings.work_hours.as_ref().is_none_or(|w| w.contains(t)) {
+            if self.config().settings.work_hours.as_ref().is_none_or(|w| w.contains(t)) {
                 return Some(t);
             }
             t = cron.next_after(t)?;
@@ -292,12 +378,12 @@ impl App {
 
     /// Today's automatic report time, if there is one.
     fn report_time(&self, now: DateTime<Local>) -> Option<DateTime<Local>> {
-        let time = match self.settings.report_at {
+        let time = match self.config().settings.report_at {
             ReportAt::Off => return None,
-            ReportAt::End => self.settings.work_hours.as_ref().map_or(NaiveTime::from_hms_opt(17, 0, 0)?, |w| w.end),
+            ReportAt::End => self.config().settings.work_hours.as_ref().map_or(NaiveTime::from_hms_opt(17, 0, 0)?, |w| w.end),
             ReportAt::At(time) => time,
         };
-        if self.settings.work_hours.as_ref().is_some_and(|w| !w.is_work_day(now)) {
+        if self.config().settings.work_hours.as_ref().is_some_and(|w| !w.is_work_day(now)) {
             return None;
         }
         now.date_naive().and_time(time).and_local_timezone(Local).single()
@@ -311,7 +397,7 @@ impl App {
         }
         self.rt().last_bootstrap = Some(Local::now().date_naive());
         self.persist();
-        let prompt = self.settings.morning_bootstrap.trim().to_string();
+        let prompt = self.config().settings.morning_bootstrap.trim().to_string();
         self.side_turn(turn, &prompt, InputKind::Bootstrap).await
     }
 
@@ -373,12 +459,14 @@ impl App {
             // The report is its own event, not part of the conversation.
             Ok(_) if kind == InputKind::Report => {}
             Ok(reply) => {
-                if !reply.trim().is_empty() {
+                // Models often end an ask_user turn by repeating the question, which would show it twice.
+                let repeats_question = self.rt().pending_question.as_deref().is_some_and(|q| q.trim() == reply.trim());
+                if !reply.trim().is_empty() && !repeats_question {
                     self.emit(Event::Reply { turn, text: reply.clone() });
                 }
                 let mut rt = self.rt();
                 rt.recap.push_back((text, reply));
-                while rt.recap.len() > self.settings.recent_turns {
+                while rt.recap.len() > self.config().settings.recent_turns {
                     rt.recap.pop_front();
                 }
             }
@@ -413,7 +501,7 @@ impl App {
                 }
             }
             // Skip check-ins the machine slept through rather than firing them late.
-            let late = chrono::Duration::minutes(self.settings.late_checkin_minutes.into());
+            let late = chrono::Duration::minutes(self.config().settings.late_checkin_minutes.into());
             if Local::now() - next <= late {
                 self.checkin().await;
             }
@@ -450,7 +538,7 @@ impl App {
         }
         // The first check-in of the day builds the list; later ones run the progress check,
         // so the check-in already reflects what the sources show.
-        let progress = self.settings.progress_check.trim().to_string();
+        let progress = self.config().settings.progress_check.trim().to_string();
         let mut noticed = None;
         if self.morning_due() || !progress.is_empty() {
             let turn = self.new_turn();
@@ -465,23 +553,42 @@ impl App {
             self.emit(Event::TurnDone { turn });
         }
         self.housekeeping();
-        let text = {
+        let (text, seq) = {
             let mut rt = self.rt();
             if rt.awaiting_reply {
                 rt.missed += 1;
             }
             rt.awaiting_reply = true;
+            rt.checkin_seq += 1;
             let list = self.store.load().unwrap_or_default();
-            let mut text = checkin_prompt(list.top_open(), rt.missed, self.settings.miss_threshold);
+            let mut text = checkin_prompt(&list.active(), list.top_open(), rt.missed, self.config().settings.miss_threshold);
             if let Some(noticed) = &noticed {
                 text.push_str(&format!("\n{noticed}"));
             }
             rt.last_checkin = Some(text.clone());
-            text
+            (text, rt.checkin_seq)
         };
         let _ = self.log.append(&LogEntry::new("check-in", text.clone()));
-        self.emit(Event::CheckIn { text: text.clone() });
+        self.emit(Event::CheckIn { text: text.clone(), reminder: false });
         self.emit_status();
+        self.notify_desktop(&text).await;
+        let after = self.config().settings.remind_after_minutes;
+        if after > 0 {
+            tokio::spawn(self.clone().remind(seq, text, Duration::from_secs(u64::from(after) * 60)));
+        }
+    }
+
+    /// Sends check-in `seq` again after `after`, if it's still the latest and unanswered.
+    async fn remind(self: Arc<Self>, seq: u64, text: String, after: Duration) {
+        tokio::time::sleep(after).await;
+        {
+            let rt = self.rt();
+            if rt.paused || !rt.awaiting_reply || rt.checkin_seq != seq {
+                return;
+            }
+        }
+        let text = format!("Reminder: {text}");
+        self.emit(Event::CheckIn { text: text.clone(), reminder: true });
         self.notify_desktop(&text).await;
     }
 
@@ -517,7 +624,7 @@ impl App {
     /// Moves old done items to done.md and trims the log. Failing here never blocks a turn.
     fn housekeeping(&self) {
         let today = Local::now().date_naive();
-        match self.store.archive_done(today, self.settings.archive_after_days) {
+        match self.store.archive_done(today, self.config().settings.archive_after_days) {
             Ok(0) => {}
             Ok(n) => {
                 let mut entry = LogEntry::new("archive", "");
@@ -526,7 +633,7 @@ impl App {
             }
             Err(e) => eprintln!("archiving done items: {e:#}"),
         }
-        if let Err(e) = self.log.prune(self.settings.log_keep_days, today) {
+        if let Err(e) = self.log.prune(self.config().settings.log_keep_days, today) {
             eprintln!("trimming the log: {e:#}");
         }
     }
@@ -641,6 +748,11 @@ impl App {
             Request::Toggle { id } => {
                 answer(&mut out, self.toggle(&id).map(|summary| Event::Changed { turn: None, summary })).await
             }
+            Request::SetActive { ids, active } => {
+                let result = self.store.update(|list| list.set_active(&ids, active));
+                let result = result.and_then(|summary| self.changed_by_hand("active", &summary).map(|()| summary));
+                answer(&mut out, result.map(|summary| Event::Changed { turn: None, summary })).await
+            }
             Request::Approve { id } => match self.take_pending(&id) {
                 Ok(p) => self.turn(&mut out, format!("approve {}", p.headline()), InputKind::Approved, Some(p)).await,
                 Err(e) => answer(&mut out, Err(e)).await,
@@ -706,22 +818,30 @@ async fn write_event(out: &mut OwnedWriteHalf, event: &Event) -> Result<()> {
 
 /// One or two lines naming the single top item. After `threshold` unanswered
 /// check-ins, assume deep work or a meeting and offer a pause once; never escalate.
-fn checkin_prompt(top: Option<&Task>, missed: u32, threshold: u32) -> String {
+/// The check-in question: about the active tasks when there are any, else the top one.
+fn checkin_prompt(active: &[&Task], top: Option<&Task>, missed: u32, threshold: u32) -> String {
     let top = top.map(|t| format!("{} ({})", t.title, t.id));
+    let on = match active {
+        [] => None,
+        [one] => Some(one.label()),
+        [rest @ .., last] => Some(format!("{} and {}", rest.iter().map(|t| t.label()).collect::<Vec<_>>().join(", "), last.label())),
+    };
     if missed == threshold {
         return format!(
             "No reply to the last {missed} check-ins. I'll guess deep work or a meeting. Say \"pause\" if you want quiet."
         );
     }
     if missed > threshold {
-        return match top {
-            Some(t) => format!("When you're back: top of the list is {t}."),
-            None => "When you're back: tell me what you're on.".into(),
+        return match (on, top) {
+            (Some(on), _) => format!("When you're back: you were on {on}."),
+            (None, Some(t)) => format!("When you're back: top of the list is {t}."),
+            (None, None) => "When you're back: tell me what you're on.".into(),
         };
     }
-    match top {
-        Some(t) => format!("What are you on? Top of the list: {t}."),
-        None => "What are you on? Nothing's open on the list yet.".into(),
+    match (on, top) {
+        (Some(on), _) => format!("What are you on? Still {on}?"),
+        (None, Some(t)) => format!("What are you on? Top of the list: {t}."),
+        (None, None) => "What are you on? Nothing's open on the list yet.".into(),
     }
 }
 
@@ -747,6 +867,7 @@ pub async fn run(paths: Paths) -> Result<()> {
     app.housekeeping();
     tokio::spawn(app.clone().scheduler());
     tokio::spawn(app.clone().daily_timer());
+    tokio::spawn(app.clone().config_watcher());
     loop {
         tokio::select! {
             accepted = listener.accept() => {
@@ -771,8 +892,16 @@ mod tests {
     #[test]
     fn checkin_prompt_softens_after_threshold() {
         let task = Task::new("t1".into(), "Ship it".into());
-        assert_eq!(checkin_prompt(Some(&task), 0, 3), "What are you on? Top of the list: Ship it (t1).");
-        assert!(checkin_prompt(Some(&task), 3, 3).contains("Say \"pause\""));
-        assert!(checkin_prompt(Some(&task), 5, 3).starts_with("When you're back"));
+        assert_eq!(checkin_prompt(&[], Some(&task), 0, 3), "What are you on? Top of the list: Ship it (t1).");
+        assert!(checkin_prompt(&[], Some(&task), 3, 3).contains("Say \"pause\""));
+        assert!(checkin_prompt(&[], Some(&task), 5, 3).starts_with("When you're back"));
+    }
+
+    #[test]
+    fn checkin_prompt_names_the_active_tasks() {
+        let (a, b, c) = (Task::new("t2".into(), "Deploy".into()), Task::new("t5".into(), "Review".into()), Task::new("t7".into(), "Docs".into()));
+        assert_eq!(checkin_prompt(&[&a], Some(&c), 0, 3), "What are you on? Still Deploy (t2)?");
+        assert_eq!(checkin_prompt(&[&a, &b, &c], None, 0, 3), "What are you on? Still Deploy (t2), Review (t5) and Docs (t7)?");
+        assert_eq!(checkin_prompt(&[&a, &b], None, 5, 3), "When you're back: you were on Deploy (t2) and Review (t5).");
     }
 }

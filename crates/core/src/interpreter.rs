@@ -49,14 +49,15 @@ pub(crate) struct TurnCtx {
 
 const SYSTEM_PROMPT: &str = r#"You are Focus Coach, a local assistant that keeps one person on track during their workday. You keep their task list, read their check-in replies and commands, and do small jobs on list items: lookups, explanations, drafts and readiness checks.
 
-Each message gives you the current time, the check-in state, the task list (a markdown file the person can edit by hand; treat it as the current truth), recent log entries, recent conversation, and the new input. Act through tools; your final text is shown to the person.
+Each message gives you the current time, who the person is, the check-in state, the task list (a markdown file the person can edit by hand; treat it as the current truth), recent log entries, recent conversation, and the new input. Act through tools; your final text is shown to the person.
 
 How to behave:
 1. Keep replies short. A check-in reply usually needs one line back, or nothing beyond the list changes.
 2. Items and sections on hold are invisible: don't bring them up until the person says they're moving again.
-3. Never invent ownership. Only add a task as the person's if a source says so. If you can't tell, ask.
+3. Never invent ownership. Only add a task as the person's if a source says so. The <about_the_person> block lists their names and handles: match authors, assignees, reviewers and mentions against all of them, and look up their GitHub login with `gh api user --jq .login` when it isn't given and you can. If you still can't tell, ask.
 4. Check facts before adding them. Before listing a PR or ticket as a to-do, check its live status (pr_status / fetch_url): is it merged, closed, already answered? Settle questions from code or config (read_repo) before suggesting the person ask someone.
-5. Drift isn't failure. If the person is on something off the list, log it and ask exactly one question: add it to the list, or get back to the top item?
+5. Drift isn't failure. When the person says they're working on something that isn't on the list ("started on X", "working on X"), add it and set_active it in the same turn, without asking first; that they're doing it is the source rule 3 needs. If they call it their top priority or urgent, add it with priority 1. Only when it's unclear whether they're on it (a passing mention, "might look at X"), ask exactly one question: add it to the list, or get back to the top item?
+5a. Track what they're on. When they say they're working on items ("on the deploy and the review"), set_active those; when they say they've switched away from or stopped one, set_active it off. Several can be active at once, and an item stays active until they say otherwise; don't turn one off just because they mention another. Items marked `active` in the list are what they're on now.
 6. Read short replies as status. "yup. trying option b." means log it and move on, with no follow-up questions.
 7. A link is a command. A link with "add to the list" means fetch it, summarize it in the title, pick the section, and set a due date if the source states one.
 8. "Can we…?" means check, then propose. Look up the facts, say what's known and what's missing, and offer the change. Don't make outward changes without a go-ahead.
@@ -101,6 +102,7 @@ fn choose_tier(input: &str, kind: InputKind, llm: &LlmSettings) -> Tier {
 }
 
 fn context_block(app: &App, kind: InputKind, was_reply: bool, approved: Option<&Proposal>) -> Result<String> {
+    let config = app.config();
     let list = app.store.load()?;
     let now = Local::now();
     let mut out = format!("Now: {}\n", now.format("%a %Y-%m-%d %H:%M"));
@@ -110,9 +112,9 @@ fn context_block(app: &App, kind: InputKind, was_reply: bool, approved: Option<&
             out.push_str("Check-ins: paused until the person's next message.\n");
         } else {
             let next = rt.next_checkin.map(|t| t.format("%a %H:%M").to_string()).unwrap_or("none".into());
-            out.push_str(&format!("Check-ins: active, schedule `{}`, next {next}.\n", rt.schedule.as_ref().unwrap_or(&app.settings.schedule)));
+            out.push_str(&format!("Check-ins: active, schedule `{}`, next {next}.\n", rt.schedule.as_ref().unwrap_or(&config.settings.schedule)));
         }
-        if let Some(hours) = &app.settings.work_hours {
+        if let Some(hours) = &config.settings.work_hours {
             out.push_str(&format!("Work hours: {hours} (check-ins only fire inside them).\n"));
         }
         if !rt.pending.is_empty() {
@@ -136,19 +138,22 @@ fn context_block(app: &App, kind: InputKind, was_reply: bool, approved: Option<&
             out.push_str("</recent_conversation>\n");
         }
     }
-    let sources = &app.settings.sources;
+    if let Some(me) = config.settings.me.describe(config.settings.sources.slack_user_id.as_deref()) {
+        out.push_str(&format!("\n<about_the_person>\n{me}</about_the_person>\n"));
+    }
+    let sources = &config.settings.sources;
     out.push_str(&format!(
         "Sources: github {} (via gh), repos_root {}, Slack/Notion/Jira {}.\n",
         sources.github_org.as_deref().map(|o| format!("org {o}")).unwrap_or("any org".into()),
         sources.repos_root.as_ref().map(|p| p.display().to_string()).unwrap_or("not set".into()),
-        if matches!(app.provider, Provider::ClaudeCode(_)) && app.settings.llm.claude_code_user_mcp {
+        if matches!(*config.provider, Provider::ClaudeCode(_)) && config.settings.llm.claude_code_user_mcp {
             "through your MCP tools if you have them (otherwise not connected)"
         } else {
             "not connected yet"
         },
     ));
     out.push_str(&format!("\n<task_list>\n{}</task_list>\n", list.render()));
-    let recent = app.log.recent(app.settings.recent_log_entries);
+    let recent = app.log.recent(config.settings.recent_log_entries);
     if !recent.is_empty() {
         out.push_str(&format!("\n<recent_log>\n{}\n</recent_log>\n", recent.join("\n\n")));
     }
@@ -219,13 +224,15 @@ pub(crate) async fn run(
     let label = kind.label(was_reply);
     let framed = format!("{}\n<input kind=\"{label}\">\n{input}\n</input>", context_block(app, kind, was_reply, approved.as_ref())?);
     let mut ctx = TurnCtx { turn, changes: Vec::new(), summary: None, approved };
-    let tier = choose_tier(input, kind, &app.settings.llm);
+    // One version of the settings for the whole turn, even if focus.toml changes meanwhile.
+    let config = app.config();
+    let tier = choose_tier(input, kind, &config.settings.llm);
 
-    let reply = if let Provider::ClaudeCode(cc) = &app.provider {
+    let reply = if let Provider::ClaudeCode(cc) = &*config.provider {
         // Claude Code runs the loop; the coach's tools come back in through `focus mcp`.
         let exe = mcp_exe()?;
         *app.agent_ctx.lock().await = Some(ctx);
-        let cwd = app.settings.sources.repos_root.clone().unwrap_or_else(|| app.paths.home.clone());
+        let cwd = config.settings.sources.repos_root.clone().unwrap_or_else(|| app.paths.home.clone());
         let system = format!("{SYSTEM_PROMPT}\n\n{CLAUDE_CODE_NOTE}");
         let mcp = (exe.as_path(), vec!["mcp".to_string(), turn.to_string()], app.paths.home.as_path());
         let session = app.claude_session();
@@ -236,7 +243,7 @@ pub(crate) async fn run(
         ctx = app.agent_ctx.lock().await.take().expect("the turn context is only taken here");
         result?
     } else {
-        tool_loop(app, tier, framed, &mut ctx).await?
+        tool_loop(app, &config.provider, tier, framed, &mut ctx).await?
     };
 
     let mut entry = LogEntry::new(
@@ -254,12 +261,12 @@ pub(crate) async fn run(
 }
 
 /// The tool loop for providers that hand tool calls back to us.
-async fn tool_loop(app: &Arc<App>, tier: Tier, framed: String, ctx: &mut TurnCtx) -> Result<String> {
+async fn tool_loop(app: &Arc<App>, provider: &Provider, tier: Tier, framed: String, ctx: &mut TurnCtx) -> Result<String> {
     let mut messages = vec![json!({"role": "user", "content": framed})];
     let defs = tools::definitions();
     let mut reply = String::new();
     for step in 0..MAX_STEPS {
-        let t = app.provider.turn(tier, SYSTEM_PROMPT, &defs, &messages).await?;
+        let t = provider.turn(tier, SYSTEM_PROMPT, &defs, &messages).await?;
         if !t.text.trim().is_empty() {
             reply = t.text.clone();
         }

@@ -2,10 +2,11 @@
 //! Plain text goes to the interpreter; `/pause`, `/next` and friends map to requests.
 
 use std::cell::Cell;
+use std::ops::Range;
 use std::time::Duration;
 
 use anyhow::Result;
-use chrono::Local;
+use chrono::{DateTime, Local};
 use focus_core::store::{State, TaskId, TaskList};
 use focus_core::{Event, Paths, Request, Status, client};
 use ratatui::crossterm::event::{
@@ -20,7 +21,7 @@ use ratatui::widgets::{Block, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 use tokio::sync::mpsc;
 
-const HELP: &str = "Type anything to talk to the coach (Alt+Enter for a new line). Commands: /next /pause /resume /report /add <title or url> /note [id] <text> /approve <id> /reject <id> /copy /start [sources] /quit. Click a task's mark to check it off, or its title for details. Drag the middle border or press Alt+←/→ to resize. F2 lets you select text; Ctrl+Y copies the last reply.";
+const HELP: &str = "Type anything to talk to the coach (Alt+Enter for a new line). Commands: /next /pause /resume /report /add <title or url> /note [id] <text> /on [ids] /off [ids] /approve <id> /reject <id> /copy /start [sources] /quit. Click a task's mark to check it off, or its title for details; right-click it to mark it as what you're on (● active); click a link to open it. Drag the middle border or press Alt+←/→ to resize. F2 lets you select text; Ctrl+Y copies the last reply.";
 
 enum Msg {
     Key(TermEvent),
@@ -50,7 +51,8 @@ struct Ui {
     paths: Paths,
     tx: mpsc::UnboundedSender<Msg>,
     input: String,
-    entries: Vec<Entry>,
+    /// The conversation, each entry with when it arrived.
+    entries: Vec<(DateTime<Local>, Entry)>,
     tasks: TaskList,
     status: Option<Status>,
     connected: bool,
@@ -102,7 +104,7 @@ pub async fn run(paths: Paths) -> Result<()> {
         paths,
         tx,
         input: String::new(),
-        entries: vec![Entry::Info(HELP.into())],
+        entries: vec![(Local::now(), Entry::Info(HELP.into()))],
         tasks: TaskList::default(),
         status: None,
         connected: false,
@@ -207,7 +209,7 @@ impl Ui {
 
     fn on_event(&mut self, ev: Event) {
         let entry = match ev {
-            Event::CheckIn { text } => Entry::CheckIn(text),
+            Event::CheckIn { text, .. } => Entry::CheckIn(text),
             Event::Note { text } => Entry::Info(format!("note to self: {text}")),
             Event::Proposal { proposal: p, .. } => Entry::Proposal(format!(
                 "{}, awaiting approval: /approve {id} or /reject {id}\n{}",
@@ -231,8 +233,12 @@ impl Ui {
             // Tasks come from refresh_tasks; the rest isn't for the conversation.
             Event::Tasks { .. } | Event::TurnDone { .. } | Event::ToolResult { .. } | Event::Done => return,
         };
-        self.entries.push(entry);
+        self.push(entry);
         self.scroll = 0;
+    }
+
+    fn push(&mut self, entry: Entry) {
+        self.entries.push((Local::now(), entry));
     }
 
     fn refresh_tasks(&self) {
@@ -254,6 +260,14 @@ impl Ui {
             MouseEventKind::Down(MouseButton::Left) => {
                 if let Some((id, on_mark)) = self.task_at(at) {
                     if on_mark { self.toggle(id) } else { self.select(id) }
+                } else if let Some(url) = self.link_at(at) {
+                    self.open_url(&url);
+                }
+            }
+            MouseEventKind::Down(MouseButton::Right) => {
+                if let Some((id, _)) = self.task_at(at) {
+                    let active = !self.tasks.get(id.as_str()).is_ok_and(|t| t.active);
+                    self.send(Request::SetActive { ids: vec![id], active });
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) if self.dragging => {
@@ -314,13 +328,13 @@ impl Ui {
         } else {
             "Select mode: drag to select and copy with your terminal. F2 to go back."
         };
-        self.entries.push(Entry::Info(what.into()));
+        self.push(Entry::Info(what.into()));
         self.scroll = 0;
     }
 
     /// The coach's last reply, as plain text.
     fn last_reply(&self) -> Option<&str> {
-        self.entries.iter().rev().find_map(|e| match e {
+        self.entries.iter().rev().find_map(|(_, e)| match e {
             Entry::Coach(t) | Entry::Question(t) | Entry::Proposal(t) | Entry::CheckIn(t) => Some(t.as_str()),
             Entry::Preview { content, .. } => Some(content.as_str()),
             _ => None,
@@ -329,14 +343,14 @@ impl Ui {
 
     fn copy_last_reply(&mut self) {
         let Some(text) = self.last_reply().map(String::from) else {
-            self.entries.push(Entry::Error("nothing to copy yet".into()));
+            self.push(Entry::Error("nothing to copy yet".into()));
             return;
         };
         let note = match copy_to_clipboard(&text) {
             Ok(()) => Entry::Info(format!("copied {} characters", text.chars().count())),
             Err(e) => Entry::Error(format!("couldn't copy: {e}")),
         };
-        self.entries.push(note);
+        self.push(note);
         self.scroll = 0;
     }
 
@@ -372,7 +386,7 @@ impl Ui {
             text.push_str(&format!("\nsource: {source}"));
         }
         text.push_str(if task.links.is_empty() { "\n/note <text> adds a note." } else { "\n/note <text> adds a note; Enter opens the first link." });
-        self.entries.push(Entry::Task(text));
+        self.push(Entry::Task(text));
         self.scroll = 0;
         self.selected = Some(id);
     }
@@ -380,14 +394,19 @@ impl Ui {
     fn open_selected(&mut self) {
         let Some(id) = &self.selected else { return };
         let Some(link) = self.tasks.get(id.as_str()).ok().and_then(|t| t.links.first().cloned()) else {
-            self.entries.push(Entry::Error(format!("{id} has no links")));
+            self.push(Entry::Error(format!("{id} has no links")));
             return;
         };
+        self.open_url(&link);
+    }
+
+    fn open_url(&mut self, link: &str) {
         let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
-        match std::process::Command::new(opener).arg(&link).spawn() {
-            Ok(_) => self.entries.push(Entry::Info(format!("opened {link}"))),
-            Err(e) => self.entries.push(Entry::Error(format!("couldn't open {link}: {e}"))),
+        match std::process::Command::new(opener).arg(link).spawn() {
+            Ok(_) => self.push(Entry::Info(format!("opened {link}"))),
+            Err(e) => self.push(Entry::Error(format!("couldn't open {link}: {e}"))),
         }
+        self.scroll = 0;
     }
 
     fn submit(&mut self) {
@@ -402,24 +421,32 @@ impl Ui {
                 return;
             }
             Input::Help => {
-                self.entries.push(Entry::Info(HELP.into()));
+                self.push(Entry::Info(HELP.into()));
                 return;
             }
             Input::Unknown(c) => {
-                self.entries.push(Entry::Error(format!("unknown command {c}. {HELP}")));
+                self.push(Entry::Error(format!("unknown command {c}. {HELP}")));
                 return;
             }
             Input::Copy => return self.copy_last_reply(),
             Input::Note { id, text: note } => match id.or_else(|| self.selected.clone()) {
                 Some(id) => Request::Note { id, text: note },
                 None => {
-                    self.entries.push(Entry::Error("Which task? Click it first, or name it: /note t3 waiting on legal".into()));
+                    self.push(Entry::Error("Which task? Click it first, or name it: /note t3 waiting on legal".into()));
+                    return;
+                }
+            },
+            Input::Active { ids, active } => match (ids.is_empty(), self.selected.clone()) {
+                (false, _) => Request::SetActive { ids, active },
+                (true, Some(id)) => Request::SetActive { ids: vec![id], active },
+                (true, None) => {
+                    self.push(Entry::Error("Which task? Click it first, or name it: /on t3 t5".into()));
                     return;
                 }
             },
             Input::Send(request) => request,
         };
-        self.entries.push(Entry::You(text.to_string()));
+        self.push(Entry::You(text.to_string()));
         self.scroll = 0;
         self.send(request);
     }
@@ -474,13 +501,8 @@ impl Ui {
         let border = if self.dragging { Style::new().fg(Color::Yellow) } else { Style::new() };
         f.render_widget(Paragraph::new(lines).block(Block::bordered().title(title).border_style(border)), tasks_area);
 
-        let inner_width = chat_area.width.saturating_sub(2) as usize;
-        let inner_height = chat_area.height.saturating_sub(2) as usize;
-        let lines = self.chat_lines(inner_width.max(10));
-        let max_scroll = lines.len().saturating_sub(inner_height);
-        let scroll = self.scroll.min(max_scroll);
-        let start = lines.len().saturating_sub(inner_height + scroll);
-        let visible: Vec<Line> = lines.into_iter().skip(start).take(inner_height).collect();
+        let (rows, scroll) = self.chat_view(chat_area);
+        let visible: Vec<Line> = rows.into_iter().map(|(line, _)| line).collect();
         let title = if scroll > 0 { format!(" Coach (↑{scroll}) ") } else { " Coach ".into() };
         f.render_widget(Paragraph::new(visible).block(Block::bordered().title(title)), chat_area);
 
@@ -523,7 +545,8 @@ impl Ui {
     /// it. Long titles wrap; every row of a task maps to that task for clicks.
     fn task_lines(&self, width: usize) -> Vec<(Line<'static>, Option<TaskId>)> {
         let today = Local::now().date_naive();
-        let top = self.tasks.top_open().map(|t| t.id.clone());
+        // The top item is only worth pointing at when nothing is marked active.
+        let top = self.tasks.active().is_empty().then(|| self.tasks.top_open().map(|t| t.id.clone())).flatten();
         let mut lines = Vec::new();
         for section in &self.tasks.sections {
             let visible: Vec<_> = section
@@ -549,6 +572,7 @@ impl Ui {
             for task in visible {
                 let is_top = top.as_ref() == Some(&task.id);
                 let (mark, style) = match task.state {
+                    State::Open if task.active => ("●", Style::new().fg(Color::Cyan).bold()),
                     State::Open if is_top => ("▶", Style::new().fg(Color::Yellow).bold()),
                     State::Open => ("○", Style::new()),
                     State::Done { .. } => ("✓", Style::new().fg(Color::Green).dim()),
@@ -585,9 +609,40 @@ impl Ui {
         lines
     }
 
-    fn chat_lines(&self, width: usize) -> Vec<Line<'static>> {
+    /// The conversation rows that fit `area` (the pane, border included) at the current
+    /// scroll, and that scroll after clamping.
+    fn chat_view(&self, area: Rect) -> (Vec<ChatRow>, usize) {
+        let inner_width = area.width.saturating_sub(2) as usize;
+        let inner_height = area.height.saturating_sub(2) as usize;
+        let rows = self.chat_lines(inner_width.max(10));
+        let scroll = self.scroll.min(rows.len().saturating_sub(inner_height));
+        let start = rows.len().saturating_sub(inner_height + scroll);
+        (rows.into_iter().skip(start).take(inner_height).collect(), scroll)
+    }
+
+    /// The link drawn at a screen position in the conversation, if any.
+    fn link_at(&self, at: Position) -> Option<String> {
+        let inner = self.chat_area.get().inner(ratatui::layout::Margin::new(1, 1));
+        if !inner.contains(at) {
+            return None;
+        }
+        let (rows, _) = self.chat_view(self.chat_area.get());
+        let (_, links) = rows.into_iter().nth((at.y - inner.y) as usize)?;
+        let column = at.x - inner.x;
+        links.into_iter().find(|(cols, _)| cols.contains(&column)).map(|(_, url)| url)
+    }
+
+    fn chat_lines(&self, width: usize) -> Vec<ChatRow> {
+        // When each entry arrived, in a right-hand column: "14:07", or "Tue 14:07" from
+        // an earlier day. Left blank when it's the same as the entry above.
+        let today = Local::now().date_naive();
+        let stamp = |at: &DateTime<Local>| at.format(if at.date_naive() == today { "%H:%M" } else { "%a %H:%M" }).to_string();
+        let gutter = self.entries.iter().map(|(at, _)| stamp(at).chars().count() + 1).max().unwrap_or(0);
+        let mut last_stamp = String::new();
         let mut out = Vec::new();
-        for entry in &self.entries {
+        for (at, entry) in &self.entries {
+            let label = Some(stamp(at)).filter(|s| *s != last_stamp);
+            last_stamp = stamp(at);
             let (prefix, style, text): (&str, Style, String) = match entry {
                 Entry::You(t) => ("you  ", Style::new().fg(Color::Blue), t.clone()),
                 Entry::CheckIn(t) => ("⏰   ", Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD), t.clone()),
@@ -602,13 +657,38 @@ impl Ui {
                 Entry::Error(t) => ("err  ", Style::new().fg(Color::Red), t.clone()),
                 Entry::Info(t) => ("     ", Style::new().dim().italic(), t.clone()),
             };
-            for (i, chunk) in wrap(&text, width.saturating_sub(prefix.chars().count()).max(10)).into_iter().enumerate() {
+            let urls = find_urls(&text);
+            let room = width.saturating_sub(prefix.chars().count() + gutter).max(10);
+            for (i, (chunk, start)) in wrap_at(&text, room).into_iter().enumerate() {
                 let keep_gutter = i == 0 || matches!(entry, Entry::Preview { .. } | Entry::Proposal(_));
                 let lead = if keep_gutter { prefix.to_string() } else { " ".repeat(prefix.chars().count()) };
-                out.push(Line::from(vec![Span::styled(lead, style), Span::styled(chunk, style)]));
+                let mut spans = vec![Span::styled(lead, style)];
+                let mut links = Vec::new();
+                // Split the row around the parts of links on it; each part opens the whole link.
+                let end = start + chunk.len();
+                let mut at = start;
+                for url in urls.iter().filter(|u| u.start < end && u.end > start) {
+                    let (from, to) = (url.start.max(start), url.end.min(end));
+                    spans.push(Span::styled(text[at..from].to_string(), style));
+                    let column = spans.iter().map(Span::width).sum::<usize>() as u16;
+                    let part = Span::styled(text[from..to].to_string(), style.underlined());
+                    links.push((column..column + part.width() as u16, text[url.clone()].to_string()));
+                    spans.push(part);
+                    at = to;
+                }
+                spans.push(Span::styled(text[at..end].to_string(), style));
+                if i == 0
+                    && let Some(label) = &label
+                {
+                    let used: usize = spans.iter().map(Span::width).sum();
+                    let pad = width.saturating_sub(used + label.chars().count());
+                    spans.push(Span::raw(" ".repeat(pad)));
+                    spans.push(Span::styled(label.clone(), Style::new().dim()));
+                }
+                out.push((Line::from(spans), links));
             }
             if !matches!(entry, Entry::Change(_)) {
-                out.push(Line::raw(""));
+                out.push((Line::raw(""), Vec::new()));
             }
         }
         out
@@ -622,6 +702,8 @@ enum Input {
     Copy,
     /// `/note [id] text`: without an id, the selected task.
     Note { id: Option<TaskId>, text: String },
+    /// `/on [ids]` and `/off [ids]`: without ids, the selected task.
+    Active { ids: Vec<TaskId>, active: bool },
     Unknown(String),
     Send(Request),
 }
@@ -644,6 +726,10 @@ fn parse_input(text: &str) -> Input {
                 (true, text) => Input::Note { id: Some(TaskId::parse(first)), text: text.into() },
                 (false, _) => Input::Note { id: None, text: arg.into() },
             };
+        }
+        "/on" | "/off" => {
+            let ids = arg.split([' ', ',']).filter(|s| !s.is_empty()).map(TaskId::parse).collect();
+            return Input::Active { ids, active: cmd == "/on" };
         }
         "/next" => Request::Next,
         "/pause" => Request::Pause,
@@ -673,6 +759,9 @@ fn add_request(arg: &str) -> Request {
     }
     Request::add(&title.join(" "), section, due)
 }
+
+/// A conversation row, with the columns of each link on it and the URL each opens.
+type ChatRow = (Line<'static>, Vec<(Range<u16>, String)>);
 
 /// Narrowest and widest the task pane can be dragged, in percent.
 const MIN_SPLIT: u16 = 15;
@@ -714,29 +803,72 @@ fn base64(bytes: &[u8]) -> String {
 
 /// Word-wraps each line of `text` to `width` columns.
 fn wrap(text: &str, width: usize) -> Vec<String> {
+    wrap_at(text, width).into_iter().map(|(row, _)| row).collect()
+}
+
+/// Like `wrap`, with the byte offset in `text` where each row starts. A row is always
+/// a run of `text` as written, so offsets within it map straight back.
+fn wrap_at(text: &str, width: usize) -> Vec<(String, usize)> {
     let mut out = Vec::new();
     for line in text.lines() {
-        let mut current = String::new();
-        for word in line.split(' ') {
-            let needed = current.chars().count() + word.chars().count() + usize::from(!current.is_empty());
+        let mut at = line.as_ptr() as usize - text.as_ptr() as usize;
+        let (mut current, mut start) = (String::new(), at);
+        for whole in line.split(' ') {
+            let needed = current.chars().count() + whole.chars().count() + usize::from(!current.is_empty());
             if needed > width && !current.is_empty() {
-                out.push(std::mem::take(&mut current));
+                out.push((std::mem::take(&mut current), start));
             }
-            let mut word = word.to_string();
+            let (mut word, mut word_at) = (whole, at);
             while word.chars().count() > width {
-                let head: String = word.chars().take(width).collect();
-                word = word.chars().skip(width).collect();
-                out.push(head);
+                let split = word.char_indices().nth(width).map_or(word.len(), |(i, _)| i);
+                out.push((word[..split].to_string(), word_at));
+                (word, word_at) = (&word[split..], word_at + split);
             }
-            if !current.is_empty() {
+            if current.is_empty() {
+                start = word_at;
+            } else {
                 current.push(' ');
             }
-            current.push_str(&word);
+            current.push_str(word);
+            at += whole.len() + 1;
         }
-        out.push(current);
+        out.push((current, start));
     }
     if out.is_empty() {
-        out.push(String::new());
+        out.push((String::new(), 0));
+    }
+    out
+}
+
+/// Byte ranges of the web links in `text`. A link ends before whitespace or quotes;
+/// trailing punctuation and an unmatched closing bracket belong to the sentence.
+fn find_urls(text: &str) -> Vec<Range<usize>> {
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(found) = text[from..].find("http") {
+        let start = from + found;
+        let rest = &text[start..];
+        if !(rest.starts_with("https://") || rest.starts_with("http://")) {
+            from = start + 4;
+            continue;
+        }
+        let mut url = &rest[..rest.find(|c: char| c.is_whitespace() || "<>\"'`".contains(c)).unwrap_or(rest.len())];
+        while let Some(last) = url.chars().last() {
+            let open = match last {
+                ')' => Some('('),
+                ']' => Some('['),
+                '}' => Some('{'),
+                _ => None,
+            };
+            let unmatched = open.is_some_and(|o| url.matches(o).count() < url.matches(last).count());
+            if ".,;:!?*_".contains(last) || unmatched {
+                url = &url[..url.len() - 1];
+            } else {
+                break;
+            }
+        }
+        out.push(start..start + url.len());
+        from = start + url.len().max(4);
     }
     out
 }
@@ -752,7 +884,7 @@ mod tests {
             paths: Paths { home: std::env::temp_dir() },
             tx: mpsc::unbounded_channel().0,
             input: "on it".into(),
-            entries,
+            entries: entries.into_iter().map(|e| (Local::now(), e)).collect(),
             tasks: TaskList::parse(tasks),
             status,
             connected: true,
@@ -789,6 +921,8 @@ mod tests {
             busy: false,
             top: None,
             top_id: None,
+            active: vec![],
+            active_ids: vec![],
             open: 2,
             session: None,
             pending: vec![],
@@ -925,10 +1059,77 @@ mod tests {
 
         let mut ui = ui(vec![Entry::Coach("first".into()), Entry::Change("· done t1".into())], "", None);
         assert_eq!(ui.last_reply(), Some("first"), "changes aren't replies");
-        ui.entries.push(Entry::Coach("second".into()));
+        ui.push(Entry::Coach("second".into()));
         assert_eq!(ui.last_reply(), Some("second"));
         assert_eq!(base64(b"Ma"), "TWE=");
         assert_eq!(base64(b"hello world"), "aGVsbG8gd29ybGQ=");
+    }
+
+    #[test]
+    fn entries_show_when_they_arrived() {
+        let mut ui = ui(vec![], "", None);
+        let today = Local::now().date_naive();
+        let at = |day: chrono::NaiveDate, h, m| day.and_hms_opt(h, m, 0).unwrap().and_local_timezone(Local).unwrap();
+        let yesterday = today.pred_opt().unwrap();
+        ui.entries = vec![
+            (at(yesterday, 16, 5), Entry::CheckIn("What are you on?".into())),
+            (at(today, 9, 30), Entry::You("the deploy".into())),
+            (at(today, 9, 30), Entry::Coach("Noted.".into())),
+            (at(today, 11, 2), Entry::Coach("Still on it?".into())),
+        ];
+        let screen = render(&ui, 100, 20);
+        let yesterday_stamp = at(yesterday, 16, 5).format("%a 16:05").to_string();
+        assert!(screen.contains(&yesterday_stamp), "an earlier day says which:\n{screen}");
+        assert_eq!(screen.matches("09:30").count(), 1, "the same minute twice is stamped once:\n{screen}");
+        assert!(screen.lines().any(|l| l.contains("Still on it?") && l.ends_with("11:02│")), "right-aligned:\n{screen}");
+    }
+
+    #[test]
+    fn active_tasks_are_marked_and_set_by_command() {
+        assert!(matches!(parse_input("/on t3 5"), Input::Active { ids, active: true } if ids == ["t3", "t5"]));
+        assert!(matches!(parse_input("/off"), Input::Active { ids, active: false } if ids.is_empty()), "no ids: the selected task");
+
+        let tasks = "## Today\n- [ ] Review configs {id=t2}\n- [ ] Deploy {id=t3 active}\n- [ ] Docs {id=t4 active}\n";
+        let screen = render(&ui(vec![], tasks, None), 100, 20);
+        assert!(screen.contains("● Deploy") && screen.contains("● Docs"), "{screen}");
+        assert!(!screen.contains("▶"), "no top marker while tasks are active:\n{screen}");
+        let screen = render(&ui(vec![], "## Today\n- [ ] Review configs {id=t2}\n", None), 100, 20);
+        assert!(screen.contains("▶ Review configs"), "{screen}");
+    }
+
+    #[test]
+    fn finds_links_without_trailing_punctuation() {
+        let urls = |text: &str| find_urls(text).into_iter().map(|r| text[r].to_string()).collect::<Vec<_>>();
+        assert_eq!(urls("see https://x.y/pr/1."), vec!["https://x.y/pr/1"]);
+        assert_eq!(urls("(https://x.y/a) and http://z.w/b, ok"), vec!["https://x.y/a", "http://z.w/b"]);
+        assert_eq!(urls("https://en.wikipedia.org/wiki/Rust_(language)"), vec!["https://en.wikipedia.org/wiki/Rust_(language)"]);
+        assert_eq!(urls("[pr](https://x.y/1)"), vec!["https://x.y/1"]);
+        assert_eq!(urls("httpd http:/ nope"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn wrapped_rows_know_where_they_start() {
+        let text = "ab  cdefgh\nij";
+        for (row, start) in wrap_at(text, 4) {
+            assert!(text[start..].starts_with(&row), "{row:?} at {start}");
+        }
+    }
+
+    #[test]
+    fn clicking_a_link_finds_the_whole_url_even_when_wrapped() {
+        let url = "https://github.com/acme/widgets/pull/1234/files";
+        let mut ui = ui(vec![Entry::Coach(format!("Review {url}. Thanks"))], "", None);
+        ui.split = 50;
+        render(&ui, 60, 12);
+        let inner = ui.chat_area.get().inner(ratatui::layout::Margin::new(1, 1));
+        let (rows, _) = ui.chat_view(ui.chat_area.get());
+        let linked: Vec<_> = rows.iter().enumerate().filter(|(_, (_, links))| !links.is_empty()).collect();
+        assert!(linked.len() > 1, "the link wraps onto a second row");
+        for (y, (_, links)) in linked {
+            let at = Position::new(inner.x + links[0].0.start, inner.y + y as u16);
+            assert_eq!(ui.link_at(at).as_deref(), Some(url));
+        }
+        assert_eq!(ui.link_at(Position::new(inner.x + 5, inner.y + inner.height - 1)), None, "plain text isn't a link");
     }
 
     #[test]

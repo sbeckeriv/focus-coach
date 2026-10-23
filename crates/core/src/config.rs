@@ -72,6 +72,10 @@ pub struct Settings {
     #[serde(deserialize_with = "crate::hours::deserialize")]
     pub work_hours: Option<WorkHours>,
     pub miss_threshold: u32,
+    /// Minutes before an unanswered check-in is sent again, with a sound. 0 turns it off.
+    pub remind_after_minutes: u32,
+    /// The menubar app opens its popover at each check-in, not just a notification.
+    pub checkin_popover: bool,
     pub notifier: Notifier,
     /// Days a done item stays on the list before moving to done.md; 0 moves it right away.
     pub archive_after_days: u32,
@@ -92,6 +96,7 @@ pub struct Settings {
     pub recent_turns: usize,
     pub recent_log_entries: usize,
     pub llm: LlmSettings,
+    pub me: Me,
     pub sources: Sources,
 }
 
@@ -101,6 +106,8 @@ impl Default for Settings {
             schedule: Cron::parse("7,27,47 9-17 * * 1-5").expect("the default schedule parses"),
             work_hours: WorkHours::parse("9-17 Mon-Fri").expect("the default work hours parse"),
             miss_threshold: 3,
+            remind_after_minutes: 5,
+            checkin_popover: false,
             notifier: Notifier::Desktop,
             archive_after_days: 1,
             log_keep_days: 30,
@@ -112,6 +119,7 @@ impl Default for Settings {
             recent_turns: 6,
             recent_log_entries: 10,
             llm: LlmSettings::default(),
+            me: Me::default(),
             sources: Sources::default(),
         }
     }
@@ -197,7 +205,7 @@ fn effort<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Effort>, D::E
     Effort::deserialize(serde::de::value::StrDeserializer::new(text.trim())).map(Some)
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct LlmSettings {
     /// "claude" (the API), "claude-code" (shells out to `claude -p`), or "ollama" /
@@ -272,6 +280,44 @@ pub struct Sources {
     pub repos_root: Option<PathBuf>,
 }
 
+/// Who the person is, so the coach can tell their PRs, mentions and messages from other people's.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct Me {
+    pub name: Option<String>,
+    /// Nicknames and handles people use for you.
+    pub aliases: Vec<String>,
+    pub github: Option<String>,
+    /// Slack handle and/or member id, e.g. "@becker (U012345)".
+    pub slack: Option<String>,
+    pub email: Option<String>,
+    /// Anything else the coach should know about you, in your own words.
+    pub notes: String,
+}
+
+impl Me {
+    /// The lines the coach sees each turn, or None when nothing is set.
+    /// `slack_user_id` is the older `[sources]` setting, used when `slack` is unset.
+    pub fn describe(&self, slack_user_id: Option<&str>) -> Option<String> {
+        let mut out = String::new();
+        let mut line = |label: &str, value: Option<&str>| {
+            if let Some(v) = value.map(str::trim).filter(|v| !v.is_empty()) {
+                out.push_str(&format!("{label}: {v}\n"));
+            }
+        };
+        line("Name", self.name.as_deref());
+        line("Also goes by", Some(&self.aliases.join(", ")));
+        line("GitHub", self.github.as_deref());
+        line("Slack", self.slack.as_deref().or(slack_user_id));
+        line("Email", self.email.as_deref());
+        if !self.notes.trim().is_empty() {
+            out.push_str(self.notes.trim());
+            out.push('\n');
+        }
+        (!out.is_empty()).then_some(out)
+    }
+}
+
 pub const DEFAULT_BOOTSTRAP: &str = "Morning: check my open PRs, review requests and PRs merged since yesterday (gh), carry over yesterday's open items, and update the list.";
 
 const DEFAULT_CONFIG: &str = r#"# Focus Coach settings. Delete a line to fall back to its default.
@@ -279,6 +325,8 @@ const DEFAULT_CONFIG: &str = r#"# Focus Coach settings. Delete a line to fall ba
 schedule = "7,27,47 9-17 * * 1-5"   # minute hour day-of-month month day-of-week
 work_hours = "9-17 Mon-Fri"         # check-ins only fire inside these; "" = any time
 miss_threshold = 3                  # unanswered check-ins before offering "say pause"
+remind_after_minutes = 5            # resend an unanswered check-in, with a sound, after this; 0 = off
+checkin_popover = false             # the menubar app opens its popover at each check-in
 notifier = "desktop"                # "desktop" (macOS notification) or "terminal"
 archive_after_days = 1              # days done items stay in tasks.md before moving to done.md
 log_keep_days = 30                  # days of log.md to keep; 0 = keep everything
@@ -324,6 +372,16 @@ strong_effort = "high"
 # slack_user_id = "U012345"
 # notion_pages = ["https://www.notion.so/..."]
 # repos_root = "/Users/me/src"
+
+[me]   # who you are, so the coach can tell your PRs, mentions and messages from other people's
+# name = "Your Name"
+# aliases = ["nickname", "handle"]   # what people call you, in chat, PRs and docs
+# github = "your-login"
+# slack = "@you (U012345)"
+# email = "you@example.com"
+# notes = """
+# Anything else the coach should know: your team, what you own, who you report to.
+# """
 "#;
 
 impl Settings {
@@ -370,6 +428,17 @@ mod tests {
         let s = parse("work_hours = \"\"\nreport_at = \"off\"\n").unwrap();
         assert_eq!((s.work_hours, s.report_at), (None, ReportAt::Off));
         assert_eq!(parse("").unwrap().llm.provider, ProviderKind::Claude);
+    }
+
+    #[test]
+    fn me_describes_only_what_is_set() {
+        assert_eq!(parse("").unwrap().me.describe(None), None);
+        let s = parse("[me]\nname = \"Sam\"\naliases = [\"sammy\", \"sk\"]\ngithub = \"skim\"\nnotes = \"I own billing.\\n\"\n").unwrap();
+        assert_eq!(
+            s.me.describe(Some("U1")).unwrap(),
+            "Name: Sam\nAlso goes by: sammy, sk\nGitHub: skim\nSlack: U1\nI own billing.\n",
+            "the old slack_user_id fills in for slack",
+        );
     }
 
     #[test]

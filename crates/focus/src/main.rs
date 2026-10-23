@@ -45,6 +45,16 @@ enum Command {
         id: focus_core::TaskId,
         text: Vec<String>,
     },
+    /// Mark tasks as what you're on now: focus on t3 t5. Several can be active.
+    On {
+        #[arg(required = true)]
+        ids: Vec<focus_core::TaskId>,
+    },
+    /// Stop marking tasks as active: focus off t3.
+    Off {
+        #[arg(required = true)]
+        ids: Vec<focus_core::TaskId>,
+    },
     /// Approve an outgoing action the coach proposed; it then carries it out.
     Approve { id: focus_core::ActionId },
     /// Drop a proposed action without sending anything.
@@ -105,6 +115,8 @@ async fn main() -> Result<()> {
             Some(text) => Request::Note { id, text },
             None => bail!("note what? e.g. focus note t3 \"waiting on legal\""),
         },
+        Command::On { ids } => Request::SetActive { ids, active: true },
+        Command::Off { ids } => Request::SetActive { ids, active: false },
         Command::Approve { id } => Request::Approve { id },
         Command::Reject { id } => Request::Reject { id },
         Command::Next => Request::Next,
@@ -179,7 +191,7 @@ async fn ensure_daemon(paths: &Paths) -> Result<()> {
 
 fn print_event(event: &Event) {
     match event {
-        Event::CheckIn { text } => println!("⏰ {text}"),
+        Event::CheckIn { text, .. } => println!("⏰ {text}"),
         Event::Note { text } => println!("📝 {text}"),
         Event::Reply { text, .. } | Event::Ok { text } => println!("{text}"),
         Event::Question { text, .. } => println!("? {text}"),

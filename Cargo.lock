@@ -1395,7 +1395,10 @@ name = "focus-menubar"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "block2",
  "focus-core",
+ "objc2-app-kit",
+ "objc2-foundation",
  "serde",
  "serde_json",
  "tauri",

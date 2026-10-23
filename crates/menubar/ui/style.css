@@ -122,6 +122,23 @@ button:disabled { opacity: 0.5; cursor: default; }
 .task .id, .task .due { font-size: 11px; color: var(--muted); flex-shrink: 0; }
 .task .name { flex: 1; min-width: 0; overflow-wrap: anywhere; cursor: pointer; }
 .task .notes { font-size: 11px; color: var(--muted); flex-shrink: 0; }
+/* "On it" / "Stop": shown on hover, so the list stays quiet. */
+.task .on {
+  visibility: hidden;
+  flex-shrink: 0;
+  font: inherit;
+  font-size: 11px;
+  color: var(--muted);
+  background: none;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0 5px;
+  cursor: pointer;
+}
+.task:hover .on, .task .on:focus-visible { visibility: visible; }
+.task .on:hover { color: var(--you); border-color: var(--you); }
+.task.active .mark { color: var(--you); }
+.task.active .name { font-weight: 600; }
 .details {
   margin: 2px 0 6px 24px;
   padding: 6px 8px;
@@ -162,6 +179,18 @@ button:disabled { opacity: 0.5; cursor: default; }
 }
 
 .msg { white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; }
+.msg > time {
+  float: right;
+  margin: 1px 0 0 10px;
+  font: 11px/1.45 -apple-system, BlinkMacSystemFont, sans-serif;
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+  user-select: none; /* copying a message copies just the message */
+}
+.msg.you > time { float: none; margin: 0 8px 0 0; }
+.msg a, .details a { color: var(--you); text-decoration: underline; text-underline-offset: 2px; cursor: pointer; }
+.msg a:hover, .details a:hover { text-decoration-thickness: 2px; }
 .msg.you { align-self: flex-end; max-width: 85%; color: var(--you); text-align: right; }
 .msg.checkin { border-left: 3px solid var(--accent); padding-left: 8px; font-weight: 600; }
 .msg.question { color: var(--accent); }

@@ -26,8 +26,9 @@ Be brief: one line per item, keep task ids, no preamble. Use they/them for the p
 /// Writes today's report to `reports/YYYY-MM-DD.md` and returns its text and path.
 pub(crate) async fn generate(app: &App) -> Result<(String, PathBuf)> {
     let today = Local::now().date_naive();
+    let config = app.config();
     let list = app.store.load()?;
-    let since = today - Duration::days(app.settings.report_lookback_days.into());
+    let since = today - Duration::days(config.settings.report_lookback_days.into());
     let log = app.log.since(since);
     // Finished items move to done.md, one section per day; bring back the last week of them.
     let mut done = app.store.load_done()?;
@@ -40,7 +41,7 @@ pub(crate) async fn generate(app: &App) -> Result<(String, PathBuf)> {
         log.join("\n\n"),
     );
     let messages = [json!({"role": "user", "content": prompt})];
-    let turn = app.provider.turn(Tier::Strong, REPORT_PROMPT, &[], &messages).await?;
+    let turn = config.provider.turn(Tier::Strong, REPORT_PROMPT, &[], &messages).await?;
     let text = turn.text.trim().to_string();
     let path = app.paths.reports().join(format!("{today}.md"));
     crate::store::write_atomic(&path, &format!("# Focus report {today}\n\n{text}\n"))?;

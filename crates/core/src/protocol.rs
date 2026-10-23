@@ -32,6 +32,8 @@ pub enum Request {
     Note { id: TaskId, text: String },
     /// Check a task off, or reopen it if it's done. No model call.
     Toggle { id: TaskId },
+    /// Mark tasks as being worked on now, or not. Any number can be. No model call.
+    SetActive { ids: Vec<TaskId>, active: bool },
     /// A coach tool call from `focus mcp`, run inside the active claude-code turn.
     Tool { turn: TurnId, name: String, input: serde_json::Value },
     Report,
@@ -56,6 +58,11 @@ pub struct Status {
     /// The top item's id, so front ends can mark it without re-deriving the order.
     #[serde(default)]
     pub top_id: Option<TaskId>,
+    /// What the person is on now ("Title (t3)"), and the same tasks' ids, in list order.
+    #[serde(default)]
+    pub active: Vec<String>,
+    #[serde(default)]
+    pub active_ids: Vec<TaskId>,
     pub open: usize,
     /// The Claude Code session the coach is in, for provider = "claude-code".
     #[serde(default)]
@@ -153,8 +160,11 @@ impl Status {
                 None => "no upcoming check-in".to_string(),
             }
         };
-        let top = self.top.as_deref().unwrap_or("nothing open");
-        let mut out = format!("{} open · top: {top} · {timer}", self.open);
+        let mut out = if self.active.is_empty() {
+            format!("{} open · top: {} · {timer}", self.open, self.top.as_deref().unwrap_or("nothing open"))
+        } else {
+            format!("{} open · on: {} · {timer}", self.open, self.active.join(", "))
+        };
         if !self.pending.is_empty() {
             out.push_str(&format!(" · {} awaiting approval", self.pending.len()));
         }
@@ -184,7 +194,12 @@ impl std::str::FromStr for TurnId {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
-    CheckIn { text: String },
+    /// `reminder`: a resend of a check-in still unanswered; front ends that notify make it louder.
+    CheckIn {
+        text: String,
+        #[serde(default)]
+        reminder: bool,
+    },
     /// A note to self the coach sent; front ends that notify show it like a check-in.
     Note { text: String },
     Reply { turn: TurnId, text: String },

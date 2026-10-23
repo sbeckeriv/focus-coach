@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use chrono::Local;
 use focus_core::store::TaskList;
-use focus_core::{Event, Paths, Request, Status, client, daemon};
+use focus_core::{Event, Paths, Request, Status, TaskId, client, daemon};
 use serde_json::json;
 use support::{MockLlm, Reply, calls, text, tool_results, user_prompt, write_config};
 use tempfile::TempDir;
@@ -217,13 +217,13 @@ async fn tool_errors_go_back_to_the_model_instead_of_failing_the_turn() {
 #[tokio::test]
 async fn ask_user_shows_the_question_and_carries_it_into_the_next_turn() {
     let h = start(TASKS).await;
-    h.llm.script([calls(&[("ask_user", json!({"question": "Which PR, lodash or docs?"}))]), text("")]);
+    h.llm.script([calls(&[("ask_user", json!({"question": "Which PR, lodash or docs?"}))]), text("Which PR, lodash or docs?")]);
     let events = h.say("merged it").await;
     assert!(
         events.iter().any(|e| matches!(e, Event::Question { text, .. } if text == "Which PR, lodash or docs?")),
         "{events:?}"
     );
-    assert!(replies(&events).is_empty(), "an empty final text shouldn't produce a reply");
+    assert!(replies(&events).is_empty(), "a final text repeating the question isn't shown again: {events:?}");
 
     h.llm.script([text("ok")]);
     h.say("lodash").await;
@@ -285,6 +285,58 @@ async fn toggle_checks_off_and_reopens_without_the_model() {
     let events = h.send(Request::Toggle { id: "t9".into() }).await;
     assert!(matches!(&events[0], Event::Error { .. }), "{events:?}");
     assert!(h.llm.requests().is_empty(), "toggling never calls the model");
+    h.stop().await;
+}
+
+#[tokio::test]
+async fn several_tasks_can_be_active_by_hand_or_through_the_coach() {
+    let h = start(TASKS).await;
+    let events = h.send(Request::SetActive { ids: vec!["t2".into(), "t3".into()], active: true }).await;
+    assert!(matches!(&events[0], Event::Changed { summary, .. } if summary == "on Review billing docs (t2), Review mockups (t3)"), "{events:?}");
+    let status = h.status().await;
+    assert_eq!(status.active_ids, vec![TaskId::parse("t2"), TaskId::parse("t3")]);
+    assert_eq!(status.top_id, Some(TaskId::parse("t1")), "active is separate from priority");
+    assert!(h.file("tasks.md").contains("- [ ] Review billing docs {id=t2 active}"), "{}", h.file("tasks.md"));
+    assert!(h.llm.requests().is_empty(), "marking by hand never calls the model");
+
+    h.llm.script([calls(&[("set_active", json!({"task_ids": ["t2"], "active": false}))]), text("Noted.")]);
+    h.say("done looking at billing for now").await;
+    assert_eq!(h.status().await.active_ids, vec![TaskId::parse("t3")]);
+    h.stop().await;
+}
+
+#[tokio::test]
+async fn editing_focus_toml_applies_without_a_restart() {
+    let h = start(TASKS).await;
+    let mut sub = client::subscribe(&h.paths).await.unwrap();
+    let path = h.paths.home.join("focus.toml");
+    let original = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(h.status().await.schedule, "0 3 1 1 *");
+
+    std::fs::write(&path, original.replace("0 3 1 1 *", "0 4 1 1 *")).unwrap();
+    let mut schedule = String::new();
+    for _ in 0..50 {
+        schedule = h.status().await.schedule;
+        if schedule == "0 4 1 1 *" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(schedule, "0 4 1 1 *", "the new schedule applies");
+    assert!(h.file("log.md").contains("reloaded focus.toml; schedule now 0 4 1 1 *"), "{}", h.file("log.md"));
+
+    std::fs::write(&path, "schedule = [not toml").unwrap();
+    let error = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok(Some(Event::Error { text, .. })) = sub.next().await {
+                return text;
+            }
+        }
+    })
+    .await
+    .expect("a broken file is reported");
+    assert!(error.contains("focus.toml") && error.contains("Keeping the previous settings"), "{error}");
+    assert_eq!(h.status().await.schedule, "0 4 1 1 *", "a broken file changes nothing");
     h.stop().await;
 }
 
