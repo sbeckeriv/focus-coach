@@ -76,6 +76,7 @@ fn control_request(action: &str, arg: Option<String>) -> Result<Request, String>
     Ok(match action {
         "pause" => Request::Pause,
         "resume" => Request::Resume,
+        "new-session" => Request::NewSession,
         "next" => Request::Next,
         "report" => Request::Report,
         "add" => Request::add(&need("a title or a URL")?, None, None),
@@ -271,6 +272,12 @@ fn notify(app: &AppHandle, text: &str, check_in: bool, reminder: bool) {
     let _ = builder.show();
 }
 
+/// Whether a check-in opens the popover: once `after` (`checkin_popover`) check-ins in a
+/// row are waiting on a reply. 0 never does.
+fn opens_popover(after: u32, unanswered: u32) -> bool {
+    after > 0 && unanswered >= after
+}
+
 /// What a check-in button asks the daemon, about the tasks named in the notification:
 /// their ids, space-separated, and their labels.
 fn button_request(action: &str, tasks: &str, labels: &str) -> Option<Request> {
@@ -312,10 +319,10 @@ async fn subscribe_loop(app: AppHandle, paths: Paths) {
             while let Ok(Some(ev)) = sub.next().await {
                 match &ev {
                     Event::Status { status } => apply_status(&app, status),
-                    Event::CheckIn { text, reminder } => {
+                    Event::CheckIn { text, reminder, unanswered } => {
                         notify(&app, text, true, *reminder);
                         // Read each time, so a focus.toml edit applies without a restart.
-                        if Settings::load(&paths).is_ok_and(|s| s.checkin_popover) {
+                        if Settings::load(&paths).is_ok_and(|s| opens_popover(s.checkin_popover, *unanswered)) {
                             show_popover(&app, None);
                         }
                     }
@@ -509,6 +516,15 @@ mod tests {
     }
 
     #[test]
+    fn popover_opens_after_enough_unanswered_check_ins() {
+        assert!(!opens_popover(0, 5), "0 never opens it");
+        assert!(opens_popover(1, 1), "1 opens it at every check-in");
+        assert!(!opens_popover(2, 1));
+        assert!(opens_popover(2, 2), "the second check-in in a row without a reply");
+        assert!(opens_popover(2, 3));
+    }
+
+    #[test]
     fn tray_title_reflects_state() {
         assert_eq!(tray_title(&status(true, true)), "⏸", "paused wins");
         assert_eq!(tray_title(&status(false, true)), "", "a waiting reply turns the icon red instead");
@@ -518,6 +534,7 @@ mod tests {
     #[test]
     fn control_actions_map_to_requests() {
         assert!(matches!(control_request("pause", None), Ok(Request::Pause)));
+        assert!(matches!(control_request("new-session", None), Ok(Request::NewSession)));
         assert!(matches!(control_request("resume", None), Ok(Request::Resume)));
         assert!(matches!(control_request("next", None), Ok(Request::Next)));
         assert!(matches!(control_request("report", None), Ok(Request::Report)));

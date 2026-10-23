@@ -104,6 +104,9 @@ pub(crate) struct ClaudeSession {
     pub date: NaiveDate,
     /// Whether Claude Code has saved it yet, so the next turn resumes instead of creating it.
     pub started: bool,
+    /// The rules it started under (`interpreter::rules_version`); new rules start a new session.
+    #[serde(default)]
+    pub rules: u64,
 }
 
 /// Decrements the notifier count when a notifying subscriber goes away.
@@ -245,13 +248,33 @@ impl App {
         let mut rt = self.rt();
         let current = rt.session.as_ref().is_some_and(|s| match &fixed {
             Some(id) => &s.id == id,
-            None => s.date == today,
+            None => s.date == today && s.rules == interpreter::rules_version(),
         });
         if !current {
             let id = fixed.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-            rt.session = Some(ClaudeSession { id, date: today, started: false });
+            rt.session = Some(ClaudeSession { id, date: today, started: false, rules: interpreter::rules_version() });
         }
         rt.session.clone().expect("set above")
+    }
+
+    /// Drops the Claude Code session and the recent exchanges each turn sees, so the next
+    /// turn starts fresh. A `session_id` in focus.toml stays, since the person pinned it.
+    fn new_session(&self) -> String {
+        let pinned = self.config().settings.llm.session_id.is_some();
+        {
+            let mut rt = self.rt();
+            if !pinned {
+                rt.session = None;
+            }
+            rt.recap.clear();
+            rt.pending_question = None;
+        }
+        self.persist();
+        if pinned {
+            "Cleared the recent conversation. The Claude Code session stays: session_id in focus.toml pins it.".into()
+        } else {
+            "Started a new session. The coach forgets the conversation so far; the list and the log stay.".into()
+        }
     }
 
     /// Claude Code has saved the session, so later turns resume it.
@@ -553,7 +576,7 @@ impl App {
             self.emit(Event::TurnDone { turn });
         }
         self.housekeeping();
-        let (text, seq) = {
+        let (text, seq, unanswered) = {
             let mut rt = self.rt();
             if rt.awaiting_reply {
                 rt.missed += 1;
@@ -566,20 +589,20 @@ impl App {
                 text.push_str(&format!("\n{noticed}"));
             }
             rt.last_checkin = Some(text.clone());
-            (text, rt.checkin_seq)
+            (text, rt.checkin_seq, rt.missed + 1)
         };
         let _ = self.log.append(&LogEntry::new("check-in", text.clone()));
-        self.emit(Event::CheckIn { text: text.clone(), reminder: false });
+        self.emit(Event::CheckIn { text: text.clone(), reminder: false, unanswered });
         self.emit_status();
         self.notify_desktop(&text).await;
         let after = self.config().settings.remind_after_minutes;
         if after > 0 {
-            tokio::spawn(self.clone().remind(seq, text, Duration::from_secs(u64::from(after) * 60)));
+            tokio::spawn(self.clone().remind(seq, unanswered, text, Duration::from_secs(u64::from(after) * 60)));
         }
     }
 
     /// Sends check-in `seq` again after `after`, if it's still the latest and unanswered.
-    async fn remind(self: Arc<Self>, seq: u64, text: String, after: Duration) {
+    async fn remind(self: Arc<Self>, seq: u64, unanswered: u32, text: String, after: Duration) {
         tokio::time::sleep(after).await;
         {
             let rt = self.rt();
@@ -588,7 +611,7 @@ impl App {
             }
         }
         let text = format!("Reminder: {text}");
-        self.emit(Event::CheckIn { text: text.clone(), reminder: true });
+        self.emit(Event::CheckIn { text: text.clone(), reminder: true, unanswered });
         self.notify_desktop(&text).await;
     }
 
@@ -736,6 +759,7 @@ impl App {
                 self.pause();
                 answer(&mut out, Ok(Event::Ok { text: "Check-ins paused until your next message.".into() })).await
             }
+            Request::NewSession => answer(&mut out, Ok(Event::Ok { text: self.new_session() })).await,
             Request::Next => self.turn(&mut out, "what's next?".into(), InputKind::Message, None).await,
             Request::Add { url } => self.turn(&mut out, format!("{url} add to the list"), InputKind::Message, None).await,
             Request::New { title, section, due } => {

@@ -17,6 +17,9 @@ pub enum Request {
     Start { text: Option<String> },
     Pause,
     Resume,
+    /// Forget the conversation so far: the next turn starts a new Claude Code session with
+    /// no recent exchanges. The list and the log stay.
+    NewSession,
     Next,
     /// Fetch a link and file it, through the coach.
     Add { url: String },
@@ -195,10 +198,13 @@ impl std::str::FromStr for TurnId {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
     /// `reminder`: a resend of a check-in still unanswered; front ends that notify make it louder.
+    /// `unanswered`: check-ins in a row now waiting on a reply, this one included.
     CheckIn {
         text: String,
         #[serde(default)]
         reminder: bool,
+        #[serde(default)]
+        unanswered: u32,
     },
     /// A note to self the coach sent; front ends that notify show it like a check-in.
     Note { text: String },

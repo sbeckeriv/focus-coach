@@ -74,8 +74,10 @@ pub struct Settings {
     pub miss_threshold: u32,
     /// Minutes before an unanswered check-in is sent again, with a sound. 0 turns it off.
     pub remind_after_minutes: u32,
-    /// The menubar app opens its popover at each check-in, not just a notification.
-    pub checkin_popover: bool,
+    /// The menubar app opens its popover, not just a notification, once this many check-ins
+    /// in a row are waiting on a reply: 1 is every check-in, 0 never. `true`/`false` mean 1/0.
+    #[serde(deserialize_with = "popover_after")]
+    pub checkin_popover: u32,
     pub notifier: Notifier,
     /// Days a done item stays on the list before moving to done.md; 0 moves it right away.
     pub archive_after_days: u32,
@@ -107,7 +109,7 @@ impl Default for Settings {
             work_hours: WorkHours::parse("9-17 Mon-Fri").expect("the default work hours parse"),
             miss_threshold: 3,
             remind_after_minutes: 5,
-            checkin_popover: false,
+            checkin_popover: 0,
             notifier: Notifier::Desktop,
             archive_after_days: 1,
             log_keep_days: 30,
@@ -194,6 +196,20 @@ impl Effort {
             Effort::Max => "max",
         }
     }
+}
+
+/// `checkin_popover`: a count, or true/false for 1/0.
+fn popover_after<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Either {
+        Flag(bool),
+        Count(u32),
+    }
+    Ok(match Either::deserialize(d).map_err(|_| serde::de::Error::custom("checkin_popover: use a number of check-ins, or true/false"))? {
+        Either::Flag(on) => u32::from(on),
+        Either::Count(n) => n,
+    })
 }
 
 /// An effort setting, where "" means none (the model's default).
@@ -320,69 +336,8 @@ impl Me {
 
 pub const DEFAULT_BOOTSTRAP: &str = "Morning: check my open PRs, review requests and PRs merged since yesterday (gh), carry over yesterday's open items, and update the list.";
 
-const DEFAULT_CONFIG: &str = r#"# Focus Coach settings. Delete a line to fall back to its default.
-
-schedule = "7,27,47 9-17 * * 1-5"   # minute hour day-of-month month day-of-week
-work_hours = "9-17 Mon-Fri"         # check-ins only fire inside these; "" = any time
-miss_threshold = 3                  # unanswered check-ins before offering "say pause"
-remind_after_minutes = 5            # resend an unanswered check-in, with a sound, after this; 0 = off
-checkin_popover = false             # the menubar app opens its popover at each check-in
-notifier = "desktop"                # "desktop" (macOS notification) or "terminal"
-archive_after_days = 1              # days done items stay in tasks.md before moving to done.md
-log_keep_days = 30                  # days of log.md to keep; 0 = keep everything
-report_at = "end"                   # end-of-day report: "end" of work hours, "HH:MM", or "off"
-report_lookback_days = 7            # days of log and done items the report covers
-late_checkin_minutes = 5            # skip check-ins that would fire later than this (after sleep)
-recent_turns = 6                    # recent exchanges each turn sees
-recent_log_entries = 10             # recent log entries each turn sees
-# The first message or check-in of each day runs this first; "" turns it off.
-# morning_bootstrap = "Morning: check my open PRs, review requests and ..."
-# Run right before each check-in to tick off finished work and add new work; "" = off.
-# progress_check = "check my PRs and Slack for progress on my current tasks or new tasks"
-
-[llm]
-provider = "claude"
-light_model = "claude-haiku-5-5"
-light_effort = "low"
-strong_model = "claude-opus-5-5"
-strong_effort = "high"
-# What sends a message to the strong model:
-# strong_keywords = ["explain", "why ", "how would", "how do we", "can we", "confused", "do we have enough"]
-# strong_min_chars = 400
-# strong_question_words = 14
-
-# A local model instead (any OpenAI-compatible server with tool calling):
-# provider = "ollama"            # or "lmstudio", or "openai" with base_url set
-# base_url = "http://localhost:11434/v1"
-# light_model = "qwen3:8b"
-# strong_model = "qwen3:32b"
-# api_key_env = "MY_SERVER_TOKEN"  # only if the server wants a bearer token
-
-# Or run each turn through Claude Code (`claude -p`) on your Claude Code login, with
-# its built-in tools (Bash, Read, Edit, WebFetch...) next to the coach's own:
-# provider = "claude-code"
-# command = "/path/to/claude"     # if it isn't on PATH or in ~/.local/bin
-# session_id = "<uuid>"           # resume one session forever; unset = a new session each day
-# claude_code_tools = ["Bash", "Read", "Edit", "Write", "Glob", "Grep", "WebFetch", "WebSearch", "mcp__focus"]
-#                                 # add your MCP servers, e.g. "mcp__slack", for the coach to use them
-# claude_code_user_mcp = true     # load your own Claude Code MCP servers next to the coach's
-
-[sources]
-# github_org = "my-org"
-# slack_user_id = "U012345"
-# notion_pages = ["https://www.notion.so/..."]
-# repos_root = "/Users/me/src"
-
-[me]   # who you are, so the coach can tell your PRs, mentions and messages from other people's
-# name = "Your Name"
-# aliases = ["nickname", "handle"]   # what people call you, in chat, PRs and docs
-# github = "your-login"
-# slack = "@you (U012345)"
-# email = "you@example.com"
-# notes = """
-# Anything else the coach should know: your team, what you own, who you report to.
-# """
-"#;
+/// Written on first run. Every setting is in it, so it doubles as the reference.
+const DEFAULT_CONFIG: &str = include_str!("../../../docs/focus.example.toml");
 
 impl Settings {
     /// Reads `focus.toml`, writing the commented default on first run.
@@ -427,6 +382,9 @@ mod tests {
 
         let s = parse("work_hours = \"\"\nreport_at = \"off\"\n").unwrap();
         assert_eq!((s.work_hours, s.report_at), (None, ReportAt::Off));
+        assert_eq!(parse("checkin_popover = 2").unwrap().checkin_popover, 2);
+        assert_eq!(parse("checkin_popover = true").unwrap().checkin_popover, 1, "true means every check-in");
+        assert_eq!(parse("").unwrap().checkin_popover, 0);
         assert_eq!(parse("").unwrap().llm.provider, ProviderKind::Claude);
     }
 
@@ -442,12 +400,37 @@ mod tests {
     }
 
     #[test]
+    fn the_example_config_sets_only_defaults() {
+        let example = parse(DEFAULT_CONFIG).unwrap();
+        assert_eq!(format!("{example:?}"), format!("{:?}", Settings::default()));
+    }
+
+    /// Every field of the settings structs is mentioned in the example, set or commented.
+    #[test]
+    fn the_example_config_covers_every_setting() {
+        let source = include_str!("config.rs");
+        for name in ["Settings", "LlmSettings", "Sources", "Me"] {
+            let body = source.split(&format!("pub struct {name} {{\n")).nth(1).unwrap().split("\n}").next().unwrap();
+            for field in body.lines().filter_map(|l| l.trim().strip_prefix("pub ")?.split_once(':').map(|(f, _)| f)) {
+                assert!(
+                    DEFAULT_CONFIG.lines().any(|l| {
+                        let l = l.trim_start_matches(['#', ' ']);
+                        l.starts_with(&format!("{field} =")) || l.starts_with(&format!("[{field}]"))
+                    }),
+                    "docs/focus.example.toml doesn't mention {name}.{field}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn mistakes_fail_when_the_config_loads() {
         for (toml, says) in [
             ("report_at = \"5pm\"", "report_at \"5pm\""),
             ("schedule = \"every 20 minutes\"", "cron needs 5 fields"),
             ("work_hours = \"nine to five\"", "expected e.g. \"9-17 Mon-Fri\""),
             ("[llm]\nprovider = \"gpt\"", "unknown variant `gpt`"),
+            ("checkin_popover = \"often\"", "checkin_popover: use a number"),
             ("[llm]\nlight_effort = \"extreme\"", "unknown variant `extreme`"),
         ] {
             let err = parse(toml).unwrap_err();

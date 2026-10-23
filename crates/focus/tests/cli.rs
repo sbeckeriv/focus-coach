@@ -262,8 +262,27 @@ async fn claude_code_keeps_one_session_per_day_across_restarts() {
     std::fs::write(home.join("state.json"), state.to_string()).unwrap();
     assert!(run(home, &["say", "new day"]).await.0);
     let calls = claude_calls(home);
-    let next = flag(&calls[2], "--session-id").expect("a new day creates a new session");
+    let next = flag(&calls[2], "--session-id").expect("a new day creates a new session").to_string();
     assert_ne!(next, id);
+
+    // So do new rules: a session from an older build isn't resumed.
+    let _ = run(home, &["stop"]).await;
+    let state = std::fs::read_to_string(home.join("state.json")).unwrap();
+    let mut state: serde_json::Value = serde_json::from_str(&state).unwrap();
+    state["session"]["rules"] = json!(1);
+    std::fs::write(home.join("state.json"), state.to_string()).unwrap();
+    assert!(run(home, &["say", "new rules"]).await.0);
+    let calls = claude_calls(home);
+    let newer = flag(&calls[3], "--session-id").expect("new rules create a new session").to_string();
+    assert_ne!(newer, next);
+
+    // And so does asking for one.
+    let (ok, out, _) = run(home, &["new-session"]).await;
+    assert!(ok && out.contains("Started a new session"), "{out}");
+    assert!(run(home, &["say", "fresh start"]).await.0);
+    let calls = claude_calls(home);
+    let fresh = flag(&calls[4], "--session-id").expect("new-session starts a new one");
+    assert_ne!(fresh, newer);
     let _ = run(home, &["stop"]).await;
 }
 

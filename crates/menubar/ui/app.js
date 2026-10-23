@@ -257,7 +257,7 @@ function slash(text) {
   const actions = {
     "/next": "next", "/pause": "pause", "/resume": "resume", "/report": "report",
     "/add": "add", "/start": "start", "/approve": "approve", "/reject": "reject", "/note": "note",
-    "/on": "on", "/off": "off",
+    "/on": "on", "/off": "off", "/new-session": "new-session",
   };
   // /on and /off alone mean the task whose details are open.
   const fallback = actions[cmd] === "on" || actions[cmd] === "off" ? openTask : null;

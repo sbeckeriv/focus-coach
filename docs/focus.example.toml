@@ -1,0 +1,137 @@
+# Focus Coach settings: ~/.focus/focus.toml
+#
+# This is the file the first run writes. Every setting is here: the ones without a
+# leading # are set to their defaults, and the commented ones show what you can set.
+# Delete any line to fall back to its default. Edits apply within a couple of
+# seconds, no restart needed; if the file stops parsing, the TUI and menubar say why
+# and the previous settings stay until it's fixed.
+
+# ── Check-ins ─────────────────────────────────────────────────────────────────
+
+# When check-ins fire, as cron: minute hour day-of-month month day-of-week.
+# The default is minutes 7, 27 and 47 of each hour from 9 to 17, Monday to Friday.
+#   "*/30 9-17 * * 1-5"   every half hour on weekdays
+#   "0 10,14 * * *"       10:00 and 14:00 every day
+#   "26-53/3 20 22 10 *"  every 3 minutes from 20:26 to 20:53 on Oct 22 only
+schedule = "7,27,47 9-17 * * 1-5"
+
+# Check-ins only fire inside these hours, and the workday's end is when the
+# end-of-day report runs. "9:30-17:30 Mon,Wed,Fri" works too; "" means any time.
+work_hours = "9-17 Mon-Fri"
+
+# Skip a check-in that would fire more than this many minutes late, e.g. after the
+# laptop slept through it, instead of firing it the moment you open the lid.
+late_checkin_minutes = 5
+
+# After this many check-ins in a row go unanswered, the coach stops asking and
+# offers to pause ("say pause if you want quiet").
+miss_threshold = 3
+
+# ── Notifications ─────────────────────────────────────────────────────────────
+
+# "desktop" for macOS notifications (the menubar app shows its own, with buttons),
+# or "terminal" to only print check-ins where `focus` is running.
+notifier = "desktop"
+
+# Send an unanswered check-in again, with a sound, after this many minutes.
+# Once per check-in; 0 turns reminders off.
+remind_after_minutes = 5
+
+# The menubar app also opens its popover once this many check-ins in a row are
+# waiting on you: 2 means the second unanswered one opens it, 1 opens it at every
+# check-in, 0 never does. (true and false mean 1 and 0.)
+checkin_popover = 0
+
+# ── What the coach runs on its own ────────────────────────────────────────────
+
+# Runs before your first message or check-in each day, to build or refresh the
+# list. "" turns it off. The default:
+# morning_bootstrap = "Morning: check my open PRs, review requests and PRs merged since yesterday (gh), carry over yesterday's open items, and update the list."
+
+# Runs right before each check-in, to tick off finished work and add new work from
+# your sources. It checks something off only when a source clearly shows it's done,
+# and adds something only when a source says it's yours. Off when blank. Runs once
+# per check-in, so it uses more of your model plan than check-ins alone.
+progress_check = ""
+# progress_check = "check my PRs and Slack for progress on my current tasks or new tasks"
+
+# The end-of-day report: "end" of work_hours (17:00 when there are none), a time
+# like "17:30", or "off". `focus report` writes one any time.
+report_at = "end"
+
+# ── How much the coach sees and keeps ─────────────────────────────────────────
+
+# Recent exchanges and log entries included in each turn.
+recent_turns = 6
+recent_log_entries = 10
+
+# Days of log and finished items the end-of-day report covers.
+report_lookback_days = 7
+
+# Days a done item stays on the list before moving to done.md; 0 moves it right away.
+archive_after_days = 1
+
+# Days of log.md to keep; older entries are deleted. 0 keeps everything.
+log_keep_days = 30
+
+# ── The model ─────────────────────────────────────────────────────────────────
+
+[llm]
+# "claude"       the Claude API, with ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN or `ant auth login`
+# "claude-code"  runs each turn through `claude -p` on your Claude Code login (no API key)
+# "ollama", "lmstudio", or "openai" (any OpenAI-compatible server, with base_url)
+provider = "claude"
+
+# The light model handles check-ins and short replies; the strong one builds the
+# list, follows links, answers design questions and writes the report.
+light_model = "claude-haiku-5-5"
+light_effort = "low"            # low, medium, high, xhigh, max; "" = the model's default
+strong_model = "claude-opus-5-5"
+strong_effort = "high"
+
+# What sends a message to the strong model: any of these words, a message at least
+# strong_min_chars long, or a question with more than strong_question_words words.
+# strong_keywords = ["explain", "why ", "how would", "how do we", "can we", "confused", "do we have enough"]
+# strong_min_chars = 400
+# strong_question_words = 14
+
+# provider = "claude-code" only:
+# command = "/path/to/claude"     # if it isn't on PATH or in ~/.local/bin
+# session_id = "<uuid>"           # resume this one session forever. Unset, there's a new
+#                                 # session each day, after an update changes the coach's
+#                                 # rules, and on `focus new-session`.
+# Tools Claude Code may use without asking. A check-in runs with nobody there to click
+# "allow", so list your MCP servers too (mcp__<name> from `claude mcp list`).
+# Setting this replaces the whole list; keep mcp__focus, the coach's own tools.
+# claude_code_tools = ["Bash", "Read", "Edit", "Write", "Glob", "Grep", "WebFetch", "WebSearch", "mcp__focus"]
+# claude_code_tools = ["Bash", "Read", "Glob", "Grep", "WebFetch", "WebSearch", "mcp__focus", "mcp__slack", "mcp__claude_ai_Notion"]
+# Load your own Claude Code MCP servers (Slack, Notion, Jira...) next to the coach's.
+# claude_code_user_mcp = true
+
+# A local model instead (any OpenAI-compatible server with tool calling; give it at
+# least 32k tokens of context):
+# provider = "lmstudio"           # localhost:1234; "ollama" is localhost:11434
+# base_url = "http://localhost:1234/v1"
+# api_key_env = "MY_SERVER_TOKEN" # an environment variable with a bearer token, if needed
+# light_model = "google/gemma-4-26b-a4b"
+# strong_model = "google/gemma-4-26b-a4b"
+
+# ── Where your work lives ─────────────────────────────────────────────────────
+
+[sources]
+# github_org = "my-org"                         # scope PR searches to one org
+# repos_root = "~/src"                          # local code the coach may read; Claude Code also runs here
+# notion_pages = ["https://www.notion.so/..."]
+# slack_user_id = "U012345"                     # older spelling of [me] slack
+
+# ── Who you are ───────────────────────────────────────────────────────────────
+
+# The coach sees this on every turn, so it can tell your PRs, reviews and mentions
+# from other people's. Set what you have; empty lines are skipped.
+[me]
+# name = "Sam Kim"
+# aliases = ["sam", "sk", "skim"]               # nicknames and handles people use for you
+# github = "skim"                               # unset, the coach asks `gh api user`
+# slack = "@sam (U012345)"
+# email = "sam@example.com"
+# notes = "I'm on the billing team and own the invoices service. Reviews for api-gateway are mine too."

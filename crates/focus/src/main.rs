@@ -29,6 +29,8 @@ enum Command {
     Pause,
     /// Resume check-ins and summarize where things stand.
     Resume,
+    /// Start the coach on a new session, forgetting the conversation so far (the list stays).
+    NewSession,
     /// Add a task instantly ("renew passport --due fri"), or file a link through the coach.
     Add {
         /// A title, or a URL to fetch and summarize
@@ -110,6 +112,7 @@ async fn main() -> Result<()> {
         Command::Start { text } => Request::Start { text: joined(text) },
         Command::Pause => Request::Pause,
         Command::Resume => Request::Resume,
+        Command::NewSession => Request::NewSession,
         Command::Add { text, section, due } => add_request(text, section, due)?,
         Command::Note { id, text } => match joined(text) {
             Some(text) => Request::Note { id, text },

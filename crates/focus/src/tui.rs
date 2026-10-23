@@ -21,7 +21,7 @@ use ratatui::widgets::{Block, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 use tokio::sync::mpsc;
 
-const HELP: &str = "Type anything to talk to the coach (Alt+Enter for a new line). Commands: /next /pause /resume /report /add <title or url> /note [id] <text> /on [ids] /off [ids] /approve <id> /reject <id> /copy /start [sources] /quit. Click a task's mark to check it off, or its title for details; right-click it to mark it as what you're on (● active); click a link to open it. Drag the middle border or press Alt+←/→ to resize. F2 lets you select text; Ctrl+Y copies the last reply.";
+const HELP: &str = "Type anything to talk to the coach (Alt+Enter for a new line). Commands: /next /pause /resume /report /new-session /add <title or url> /note [id] <text> /on [ids] /off [ids] /approve <id> /reject <id> /copy /start [sources] /quit. Click a task's mark to check it off, or its title for details; right-click it to mark it as what you're on (● active); click a link to open it. Drag the middle border or press Alt+←/→ to resize. F2 lets you select text; Ctrl+Y copies the last reply.";
 
 enum Msg {
     Key(TermEvent),
@@ -734,6 +734,7 @@ fn parse_input(text: &str) -> Input {
         "/next" => Request::Next,
         "/pause" => Request::Pause,
         "/resume" => Request::Resume,
+        "/new-session" => Request::NewSession,
         "/report" => Request::Report,
         "/add" if !arg.is_empty() => add_request(arg),
         "/approve" if !arg.is_empty() => Request::Approve { id: arg.into() },
@@ -933,6 +934,7 @@ mod tests {
     fn slash_commands_map_to_requests() {
         assert!(matches!(parse_input("/next"), Input::Send(Request::Next)));
         assert!(matches!(parse_input("/pause"), Input::Send(Request::Pause)));
+        assert!(matches!(parse_input("/new-session"), Input::Send(Request::NewSession)));
         assert!(matches!(parse_input("/add https://x.y"), Input::Send(Request::Add { url }) if url == "https://x.y"));
         assert!(matches!(parse_input("/start"), Input::Send(Request::Start { text: None })));
         assert!(matches!(parse_input("/start look at my PRs"), Input::Send(Request::Start { text: Some(t) }) if t == "look at my PRs"));
