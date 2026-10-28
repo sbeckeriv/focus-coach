@@ -87,10 +87,92 @@ fn weekday(s: &str) -> Result<Weekday> {
     s.trim().parse::<Weekday>().map_err(|_| anyhow::anyhow!("bad weekday {s:?}"))
 }
 
+/// When a snooze ends: a length from `now` ("45m", "1h", "1h30m", "90 minutes"; a bare
+/// number is minutes) or a time of day ("15:00", "3pm", "3:30pm"), today or, once that's
+/// past, tomorrow.
+pub fn parse_until(text: &str, now: DateTime<Local>) -> Result<DateTime<Local>> {
+    let t = text.trim().to_lowercase().replace(' ', "");
+    if let Some(minutes) = minutes_in(&t) {
+        return Ok(now + chrono::Duration::minutes(minutes));
+    }
+    let Some(time) = time_of_day(&t) else {
+        bail!("snooze until when? e.g. 45m, 1h30m, 15:00 or 3pm (got {text:?})");
+    };
+    let mut day = now.date_naive();
+    if time <= now.time() {
+        day = day.succ_opt().context("no tomorrow")?;
+    }
+    day.and_time(time).and_local_timezone(Local).earliest().context("that time doesn't exist today")
+}
+
+/// "1h30m", "45m", "2h", "90"; None for anything else.
+fn minutes_in(t: &str) -> Option<i64> {
+    if let Ok(n) = t.parse::<i64>() {
+        return (n > 0).then_some(n);
+    }
+    let mut t = t.to_string();
+    for (long, short) in [("hours", "h"), ("hour", "h"), ("hrs", "h"), ("hr", "h"), ("minutes", "m"), ("minute", "m"), ("mins", "m"), ("min", "m")] {
+        t = t.replace(long, short);
+    }
+    let (hours, rest) = match t.split_once('h') {
+        Some((h, rest)) => (h.parse::<i64>().ok()?, rest),
+        None => (0, t.as_str()),
+    };
+    let minutes = match rest {
+        "" => 0,
+        m => m.strip_suffix('m')?.parse::<i64>().ok()?,
+    };
+    let total = hours * 60 + minutes;
+    (total > 0).then_some(total)
+}
+
+/// "15:00", "9:30", "3pm", "3:30pm", "12am".
+fn time_of_day(t: &str) -> Option<NaiveTime> {
+    let (clock, half) = match (t.strip_suffix("am"), t.strip_suffix("pm")) {
+        (Some(c), _) => (c, Some(0)),
+        (_, Some(c)) => (c, Some(12)),
+        _ => (t, None),
+    };
+    let (h, m) = clock.split_once(':').unwrap_or((clock, "0"));
+    let (mut h, m) = (h.parse::<u32>().ok()?, m.parse::<u32>().ok()?);
+    if let Some(offset) = half {
+        if !(1..=12).contains(&h) {
+            return None;
+        }
+        h = h % 12 + offset;
+    } else if !clock.contains(':') {
+        return None; // A bare number is minutes, handled above.
+    }
+    NaiveTime::from_hms_opt(h, m, 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn snooze_lengths_and_times() {
+        let now = Local.with_ymd_and_hms(2026, 10, 28, 14, 10, 0).unwrap();
+        let at = |text: &str| parse_until(text, now).map(|t| t.format("%a %H:%M").to_string()).map_err(|e| e.to_string());
+        for (text, want) in [
+            ("45m", "Wed 14:55"),
+            ("1h", "Wed 15:10"),
+            ("1h30m", "Wed 15:40"),
+            ("1 hour 30 mins", "Wed 15:40"),
+            ("90", "Wed 15:40"),
+            ("15:00", "Wed 15:00"),
+            ("3pm", "Wed 15:00"),
+            ("3:30 PM", "Wed 15:30"),
+            ("9:00", "Thu 09:00"),
+            ("12am", "Thu 00:00"),
+        ] {
+            assert_eq!(at(text).as_deref(), Ok(want), "{text}");
+        }
+        for bad in ["soon", "0", "13pm", "25:00", "1h30"] {
+            assert!(at(bad).is_err(), "{bad} should fail");
+        }
+    }
 
     fn at(day: u32, h: u32, m: u32) -> DateTime<Local> {
         // 2026-10-19 is a Monday.

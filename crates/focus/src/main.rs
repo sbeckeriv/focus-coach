@@ -27,6 +27,11 @@ enum Command {
     },
     /// Pause check-ins until your next message.
     Pause,
+    /// Hold check-ins for a while, then check in: focus snooze 45m, 1h30m, 15:00 or 3pm.
+    Snooze {
+        #[arg(required = true)]
+        until: Vec<String>,
+    },
     /// Resume check-ins and summarize where things stand.
     Resume,
     /// Start the coach on a new session, forgetting the conversation so far (the list stays).
@@ -111,6 +116,7 @@ async fn main() -> Result<()> {
         }
         Command::Start { text } => Request::Start { text: joined(text) },
         Command::Pause => Request::Pause,
+        Command::Snooze { until } => Request::Snooze { until: until.join(" ") },
         Command::Resume => Request::Resume,
         Command::NewSession => Request::NewSession,
         Command::Add { text, section, due } => add_request(text, section, due)?,

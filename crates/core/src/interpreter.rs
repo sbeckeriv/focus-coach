@@ -119,6 +119,8 @@ fn context_block(app: &App, kind: InputKind, was_reply: bool, approved: Option<&
         let mut rt = app.rt();
         if rt.paused {
             out.push_str("Check-ins: paused until the person's next message.\n");
+        } else if let Some(until) = rt.snoozed_until.filter(|until| *until > now) {
+            out.push_str(&format!("Check-ins: snoozed until {} (a check-in fires then; messages don't end it).\n", until.format("%a %H:%M")));
         } else {
             let next = rt.next_checkin.map(|t| t.format("%a %H:%M").to_string()).unwrap_or("none".into());
             out.push_str(&format!("Check-ins: active, schedule `{}`, next {next}.\n", rt.schedule.as_ref().unwrap_or(&config.settings.schedule)));

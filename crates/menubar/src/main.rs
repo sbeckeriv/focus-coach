@@ -77,6 +77,7 @@ fn control_request(action: &str, arg: Option<String>) -> Result<Request, String>
         "pause" => Request::Pause,
         "resume" => Request::Resume,
         "new-session" => Request::NewSession,
+        "snooze" => Request::Snooze { until: need("a length or a time, e.g. 45m or 15:00")? },
         "next" => Request::Next,
         "report" => Request::Report,
         "add" => Request::add(&need("a title or a URL")?, None, None),
@@ -218,10 +219,12 @@ impl TrayIcons {
     }
 }
 
-/// Text beside the menubar icon: paused or nothing. A check-in waiting on a reply turns the icon red instead.
+/// Text beside the menubar icon: paused, snoozed, or nothing. A check-in waiting on a reply turns the icon red instead.
 fn tray_title(status: &Status) -> &'static str {
     if status.paused {
         "⏸"
+    } else if status.snoozed_until.is_some() {
+        "z"
     } else {
         ""
     }
@@ -366,6 +369,8 @@ fn menu_action(app: &AppHandle, id: &str) {
         "login" => return toggle_login(app),
         "next" => Request::Next,
         "pause" => Request::Pause,
+        "snooze-30m" => Request::Snooze { until: "30m".into() },
+        "snooze-1h" => Request::Snooze { until: "1h".into() },
         "resume" => Request::Resume,
         "report" => Request::Report,
         _ => return,
@@ -457,6 +462,8 @@ fn main() {
                     &MenuItem::with_id(app, "open", "Open Focus Coach", true, None::<&str>)?,
                     &MenuItem::with_id(app, "next", "What's next?", true, None::<&str>)?,
                     &MenuItem::with_id(app, "pause", "Pause check-ins", true, None::<&str>)?,
+                    &MenuItem::with_id(app, "snooze-30m", "Snooze 30 minutes", true, None::<&str>)?,
+                    &MenuItem::with_id(app, "snooze-1h", "Snooze 1 hour", true, None::<&str>)?,
                     &MenuItem::with_id(app, "resume", "Resume check-ins", true, None::<&str>)?,
                     &MenuItem::with_id(app, "report", "End-of-day report", true, None::<&str>)?,
                     &PredefinedMenuItem::separator(app)?,
@@ -514,6 +521,7 @@ mod tests {
     fn status(paused: bool, awaiting_reply: bool) -> Status {
         Status {
             paused,
+            snoozed_until: None,
             schedule: "* * * * *".into(),
             next_checkin: None,
             awaiting_reply,
@@ -549,6 +557,8 @@ mod tests {
     fn control_actions_map_to_requests() {
         assert!(matches!(control_request("pause", None), Ok(Request::Pause)));
         assert!(matches!(control_request("new-session", None), Ok(Request::NewSession)));
+        assert!(matches!(control_request("snooze", Some("45m".into())), Ok(Request::Snooze { until }) if until == "45m"));
+        assert!(control_request("snooze", None).is_err());
         assert!(matches!(control_request("resume", None), Ok(Request::Resume)));
         assert!(matches!(control_request("next", None), Ok(Request::Next)));
         assert!(matches!(control_request("report", None), Ok(Request::Report)));

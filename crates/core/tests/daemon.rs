@@ -258,6 +258,56 @@ async fn pause_lasts_until_the_next_message_and_survives_a_restart() {
 }
 
 #[tokio::test]
+async fn snooze_holds_check_ins_until_its_end_and_survives_messages_and_restarts() {
+    let h = start_top(TASKS, "work_hours = \"\"").await;
+    let events = h.send(Request::Snooze { until: "soon".into() }).await;
+    assert!(matches!(&events[0], Event::Error { text, .. } if text.contains("e.g. 45m")), "{events:?}");
+
+    let events = h.send(Request::Snooze { until: "45m".into() }).await;
+    assert!(matches!(&events[0], Event::Ok { text } if text.starts_with("Snoozed until") && text.ends_with("I'll check in then.")), "{events:?}");
+    let until = h.status().await.snoozed_until.expect("snoozed");
+    assert!((until - Local::now() - chrono::Duration::minutes(45)).num_seconds().abs() < 5, "{until}");
+    // The scheduler rearms in the background; its next check-in is the snooze's end.
+    let mut next = None;
+    for _ in 0..50 {
+        next = h.status().await.next_checkin;
+        if next == Some(until) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(next, Some(until), "a check-in fires when the snooze ends");
+
+    h.llm.script([text("Noted.")]);
+    h.say("quick question mid-meeting").await;
+    assert_eq!(h.status().await.snoozed_until, Some(until), "a message doesn't end a snooze");
+
+    let llm = h.llm.clone();
+    let dir = h._dir;
+    let paths = Paths { home: dir.path().to_path_buf() };
+    client::request(&paths, Request::Shutdown, |_| {}).await.unwrap();
+    h.daemon.await.unwrap().unwrap();
+    let daemon = spawn_daemon(&paths).await;
+    let h = Harness { _dir: dir, paths, llm, daemon };
+    assert_eq!(h.status().await.snoozed_until, Some(until), "a snooze survives a restart");
+
+    h.llm.script([text("Back on.")]);
+    h.send(Request::Resume).await;
+    assert_eq!(h.status().await.snoozed_until, None, "resuming ends it");
+    h.stop().await;
+}
+
+#[tokio::test]
+async fn the_coach_snoozes_for_a_meeting() {
+    let h = start(TASKS).await;
+    h.llm.script([calls(&[("snooze_checkins", json!({"until": "1h"}))]), text("Snoozed for the meeting.")]);
+    h.say("in a meeting for an hour").await;
+    assert!(h.status().await.snoozed_until.is_some());
+    assert!(h.file("log.md").contains("check-ins snoozed until"), "{}", h.file("log.md"));
+    h.stop().await;
+}
+
+#[tokio::test]
 async fn pause_and_resume_tools_from_free_text() {
     let h = start(TASKS).await;
     h.llm.script([calls(&[("pause_checkins", json!({}))]), text("Paused. Talk tomorrow.")]);

@@ -17,6 +17,9 @@ pub enum Request {
     Start { text: Option<String> },
     Pause,
     Resume,
+    /// Hold check-ins until a length ("45m", "1h30m") or a time ("15:00", "3pm") from now,
+    /// then check in. Messages don't end it; `Resume` does.
+    Snooze { until: String },
     /// Forget the conversation so far: the next turn starts a new Claude Code session with
     /// no recent exchanges. The list and the log stay.
     NewSession,
@@ -52,6 +55,9 @@ pub enum Request {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Status {
     pub paused: bool,
+    /// When a snooze ends; a check-in fires then.
+    #[serde(default)]
+    pub snoozed_until: Option<DateTime<Local>>,
     pub schedule: String,
     pub next_checkin: Option<DateTime<Local>>,
     pub awaiting_reply: bool,
@@ -157,6 +163,8 @@ impl Status {
     pub fn summary(&self) -> String {
         let timer = if self.paused {
             "paused until your next message".to_string()
+        } else if let Some(until) = self.snoozed_until {
+            format!("snoozed until {}", until.format("%a %H:%M"))
         } else {
             match self.next_checkin {
                 Some(t) => format!("next check-in {}", t.format("%a %H:%M")),

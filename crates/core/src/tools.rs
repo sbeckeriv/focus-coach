@@ -67,7 +67,10 @@ pub fn definitions() -> Vec<Value> {
         tool("set_schedule", "Replace the one check-in schedule, until the daemon restarts or the person edits the schedule in focus.toml (which then applies again), with a 5-field cron expression (minute hour day month weekday), e.g. \"7,27,47 9-17 * * 1-5\" for every 20 minutes during weekday work hours.", json!({
             "cron": {"type": "string"},
         }), &["cron"]),
-        tool("pause_checkins", "Stop check-ins until the person's next message.", json!({}), &[]),
+        tool("pause_checkins", "Stop check-ins until the person's next message, for open-ended quiet (\"quiet until tomorrow\").", json!({}), &[]),
+        tool("snooze_checkins", "Hold check-ins until a time, then check in right then: for a meeting, call or break with an end (\"in a meeting until 3\" means until \"15:00\", \"back in an hour\" means \"1h\"). Messages don't end it; resume_checkins does.", json!({
+            "until": {"type": "string", "description": "a length (45m, 1h30m) or a time of day (15:00, 3pm)"}
+        }), &["until"]),
         tool("resume_checkins", "Restart check-ins on the current schedule.", json!({}), &[]),
         tool("write_report", "Write the end-of-day report (done by day, next in order, on hold, stale), save it and show it to the person.", json!({}), &[]),
         tool("fetch_url", "Read a link: GitHub PRs and issues through gh, other pages over HTTP. Slack, Notion and Jira links aren't connected yet.", json!({
@@ -144,6 +147,7 @@ enum Call {
     AppendLog(AppendLog),
     SetSchedule(SetSchedule),
     PauseCheckins(IgnoredAny),
+    SnoozeCheckins(SnoozeCheckins),
     ResumeCheckins(IgnoredAny),
     WriteReport(IgnoredAny),
     FetchUrl(FetchUrl),
@@ -245,6 +249,12 @@ struct SplitTask {
 struct AppendLog {
     #[serde(deserialize_with = "text")]
     summary: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SnoozeCheckins {
+    #[serde(deserialize_with = "text")]
+    until: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -520,6 +530,12 @@ async fn run(app: &Arc<App>, ctx: &mut TurnCtx, call: Call) -> Result<String> {
             app.pause();
             record(app, ctx, "check-ins paused until the next message".into());
             Ok("paused until the person's next message".into())
+        }
+        Call::SnoozeCheckins(SnoozeCheckins { until }) => {
+            let at = crate::hours::parse_until(&until, Local::now())?;
+            let said = app.snooze(at);
+            record(app, ctx, format!("check-ins snoozed until {}", at.format("%a %H:%M")));
+            Ok(said)
         }
         Call::ResumeCheckins(_) => {
             app.resume_timers();

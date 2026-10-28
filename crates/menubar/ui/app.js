@@ -109,6 +109,8 @@ function renderStatus(s) {
 function summarize(s) {
   const timer = s.paused
     ? "paused until your next message"
+    : s.snoozed_until
+    ? `snoozed until ${stamp(new Date(s.snoozed_until))}`
     : s.next_checkin
       ? `next check-in ${stamp(new Date(s.next_checkin))}`
       : "no upcoming check-in";
@@ -257,7 +259,7 @@ function slash(text) {
   const actions = {
     "/next": "next", "/pause": "pause", "/resume": "resume", "/report": "report",
     "/add": "add", "/start": "start", "/approve": "approve", "/reject": "reject", "/note": "note",
-    "/on": "on", "/off": "off", "/new-session": "new-session",
+    "/on": "on", "/off": "off", "/new-session": "new-session", "/snooze": "snooze",
   };
   // /on and /off alone mean the task whose details are open.
   const fallback = actions[cmd] === "on" || actions[cmd] === "off" ? openTask : null;

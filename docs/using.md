@@ -15,6 +15,7 @@ focus approve a1 | reject a1                       # outgoing actions the coach 
 focus tasks                                        # the list; --markdown prints tasks.md as stored
 focus checkin                                      # check in now (after the progress check)
 focus next | pause | resume | report | status | stop
+focus snooze 45m                                   # hold check-ins, then check in at the end (1h30m, 15:00, 3pm)
 focus new-session                                  # the coach forgets the conversation so far; the list stays
 focus autostart on | off                           # start the daemon at login
 ```
@@ -23,7 +24,7 @@ One daemon owns the check-in schedule, and the CLI starts it on demand. To start
 
 ## The terminal UI
 
-Type to talk to the coach. Slash commands map to the CLI: `/next`, `/pause`, `/resume`, `/report`, `/new-session`, `/add <title or url>` (with `--due` and `--section`), `/note [id] <text>` (the selected task when there's no id), `/on [ids]` and `/off [ids]` (likewise), `/approve <id>`, `/reject <id>`, `/copy` and `/start [sources]`. `/quit`, `/exit`, or `exit` on its own closes it. Alt+Enter adds a line break, and pasted text keeps its lines. With the mouse:
+Type to talk to the coach. Slash commands map to the CLI: `/next`, `/pause`, `/snooze <45m or 15:00>`, `/resume`, `/report`, `/new-session`, `/add <title or url>` (with `--due` and `--section`), `/note [id] <text>` (the selected task when there's no id), `/on [ids]` and `/off [ids]` (likewise), `/approve <id>`, `/reject <id>`, `/copy` and `/start [sources]`. `/quit`, `/exit`, or `exit` on its own closes it. Alt+Enter adds a line break, and pasted text keeps its lines. With the mouse:
 - **Click a task's mark** (○ ▶ ● ! ✓) to check it off or reopen it. This writes straight to the list, with no model call.
 - **Click a task's title** to see its notes and links. Then press Enter on an empty input to open its first link.
 - **Right-click a task** to mark it as what you're on (●), or to unmark it.
@@ -35,7 +36,7 @@ To copy text, press **F2** for select mode: the mouse goes back to your terminal
 
 ## The menubar app
 
-Click the icon for the popover: the task list on top, the conversation below, and the same slash commands as the TUI. The header shows when the next check-in is, and what you're on. Hover a task and press **On it** to mark it active; click its title for its notes and links, and to add a note. The window resizes, and the bar between the tasks and the conversation drags. Messages show the time they were sent, and links open in your browser. For a quick try without bundling, run `cargo run -p focus-menubar`.
+Click the icon for the popover: the task list on top, the conversation below, and the same slash commands as the TUI. The header shows when the next check-in is, and what you're on. Hover a task and press **On it** to mark it active; click its title for its notes and links, and to add a note. The window resizes, and the bar between the tasks and the conversation drags. Messages show the time they were sent, and links open in your browser. The icon's menu can snooze check-ins for 30 minutes or an hour; `z` beside the icon means a snooze is on, and `⏸` a pause. For a quick try without bundling, run `cargo run -p focus-menubar`.
 
 The app runs the daemon itself whenever none is running: at launch, and within a couple of seconds if the one it was using stops. So while the app is open, `focus stop` only restarts the daemon; quit the app to stop it.
 

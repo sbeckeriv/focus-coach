@@ -11,8 +11,15 @@ $ focus say "might look at the flaky test" # unclear: it asks once, add it or ge
 $ focus say "billing docs done, half of the lodash PRs cut"
   · done t2: Review billing docs
   · done t1: Cut half of the lodash PRs; left as t10: Cut the rest of the lodash PRs
+$ focus say "in a meeting until 3"       # snoozes until 15:00, then checks in
 $ focus say "quiet until tomorrow"       # pauses check-ins until your next message
 ```
+
+## Snooze or pause
+
+A **snooze** has an end: `focus snooze 45m`, `/snooze 15:00`, the icon's menu, or telling the coach "in a meeting until 3" or "back in an hour". Check-ins and reminders hold until then, and a check-in fires right at the end (or at the next slot inside `work_hours`), then the schedule carries on. Messages in between don't end it, so a quick question mid-meeting won't restart check-ins; `focus resume` or `/resume` does. A snooze survives a restart.
+
+A **pause** has no end: check-ins stop until your next message ("quiet until tomorrow", `focus pause`).
 
 ## Working on more than one thing
 
