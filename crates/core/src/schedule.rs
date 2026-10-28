@@ -63,7 +63,10 @@ impl Cron {
 
     /// The first matching minute strictly after `after`, searching up to a year out.
     pub fn next_after(&self, after: DateTime<Local>) -> Option<DateTime<Local>> {
-        let mut t = after.with_second(0)?.with_nanosecond(0)? + Duration::minutes(1);
+        // Arithmetic, not with_second: setting a field fails on a local time the clocks
+        // repeat (the hour daylight saving ends), which would leave no next check-in.
+        let start = after - Duration::seconds(after.second().into()) - Duration::nanoseconds(after.nanosecond().into());
+        let mut t = start + Duration::minutes(1);
         for _ in 0..366 * 24 * 60 {
             if self.matches(&t) {
                 return Some(t);
@@ -126,6 +129,19 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
 
+    /// Starting at half past every hour for two years crosses each daylight saving change
+    /// in this machine's zone, including the hour that happens twice.
+    #[test]
+    fn the_next_minute_is_found_across_daylight_saving() {
+        let every = Cron::parse("* * * * *").unwrap();
+        let mut t = Local::now();
+        for _ in 0..2 * 366 * 24 {
+            let next = every.next_after(t).unwrap_or_else(|| panic!("nothing after {t}"));
+            assert!(next > t && next - t <= Duration::minutes(1), "{t} -> {next}");
+            t += Duration::hours(1);
+        }
+    }
+
     #[test]
     fn work_hours_schedule() {
         let cron = Cron::parse("7,27,47 9-17 * * 1-5").unwrap();
@@ -146,3 +162,4 @@ mod tests {
         assert!(Cron::parse("* * *").is_err());
     }
 }
+

@@ -1,7 +1,7 @@
 //! Menubar front end. Hosts the daemon in-process when none is running, shows a
 //! popover chat pane on click, and mirrors the check-in state in the menubar title.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use focus_core::store::{State, TaskList};
@@ -310,29 +310,50 @@ fn on_notification_action(app: &AppHandle, performed: &ActionPerformed) {
     });
 }
 
+/// Whether this app is running the daemon in-process right now.
+static HOSTING: AtomicBool = AtomicBool::new(false);
+
+/// Runs the daemon inside the app unless one already answers: at launch, and whenever
+/// the app finds none (`focus stop`, or the CLI's daemon it was using went away).
+async fn host_daemon(paths: Paths) {
+    if HOSTING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    if !client::is_running(&paths).await
+        && let Err(e) = daemon::run(paths).await
+    {
+        eprintln!("focus daemon: {e:#}");
+    }
+    HOSTING.store(false, Ordering::SeqCst);
+}
+
 /// Forwards every daemon event to the window, keeps the tray in sync, and shows
 /// check-ins as notifications (the daemon skips its own while this is connected).
 async fn subscribe_loop(app: AppHandle, paths: Paths) {
     loop {
-        if let Ok(mut sub) = client::subscribe_as_notifier(&paths).await {
-            let _ = app.emit("focus-connected", true);
-            while let Ok(Some(ev)) = sub.next().await {
-                match &ev {
-                    Event::Status { status } => apply_status(&app, status),
-                    Event::CheckIn { text, reminder, unanswered } => {
-                        notify(&app, text, true, *reminder);
-                        // Read each time, so a focus.toml edit applies without a restart.
-                        if Settings::load(&paths).is_ok_and(|s| opens_popover(s.checkin_popover, *unanswered)) {
-                            show_popover(&app, None);
-                        }
+        let Ok(mut sub) = client::subscribe_as_notifier(&paths).await else {
+            // Nobody answers: the daemon we used was stopped or went away, so host one.
+            tauri::async_runtime::spawn(host_daemon(paths.clone()));
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            continue;
+        };
+        let _ = app.emit("focus-connected", true);
+        while let Ok(Some(ev)) = sub.next().await {
+            match &ev {
+                Event::Status { status } => apply_status(&app, status),
+                Event::CheckIn { text, reminder, unanswered } => {
+                    notify(&app, text, true, *reminder);
+                    // Read each time, so a focus.toml edit applies without a restart.
+                    if Settings::load(&paths).is_ok_and(|s| opens_popover(s.checkin_popover, *unanswered)) {
+                        show_popover(&app, None);
                     }
-                    Event::Note { text } => notify(&app, text, false, false),
-                    _ => {}
                 }
-                let _ = app.emit("focus-event", &ev);
+                Event::Note { text } => notify(&app, text, false, false),
+                _ => {}
             }
-            let _ = app.emit("focus-connected", false);
+            let _ = app.emit("focus-event", &ev);
         }
+        let _ = app.emit("focus-connected", false);
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }
@@ -406,14 +427,7 @@ fn main() {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
-            let host = paths.clone();
-            tauri::async_runtime::spawn(async move {
-                if !client::is_running(&host).await
-                    && let Err(e) = daemon::run(host).await
-                {
-                    eprintln!("focus daemon: {e:#}");
-                }
-            });
+            tauri::async_runtime::spawn(host_daemon(paths.clone()));
             tauri::async_runtime::spawn(subscribe_loop(app.handle().clone(), paths.clone()));
 
             // A click on a check-in notification opens the popover, and its buttons answer

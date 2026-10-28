@@ -409,7 +409,7 @@ impl App {
         if self.config().settings.work_hours.as_ref().is_some_and(|w| !w.is_work_day(now)) {
             return None;
         }
-        now.date_naive().and_time(time).and_local_timezone(Local).single()
+        now.date_naive().and_time(time).and_local_timezone(Local).earliest()
     }
 
     /// Runs the morning bootstrap if this is the day's first interaction, and returns its
@@ -555,9 +555,11 @@ impl App {
         }
     }
 
-    async fn checkin(self: &Arc<Self>) {
+    /// Runs a check-in, or just the progress check's findings when they make the question
+    /// unneeded (`skip_checkin_on_progress`). Returns what was shown.
+    async fn checkin(self: &Arc<Self>) -> String {
         if self.rt().paused {
-            return;
+            return String::new();
         }
         // The first check-in of the day builds the list; later ones run the progress check,
         // so the check-in already reflects what the sources show.
@@ -576,6 +578,20 @@ impl App {
             self.emit(Event::TurnDone { turn });
         }
         self.housekeeping();
+        if self.config().settings.skip_checkin_on_progress
+            && let Some(noticed) = noticed
+        {
+            // Activity is as good as an answer: nothing is waiting on the person now.
+            {
+                let mut rt = self.rt();
+                rt.awaiting_reply = false;
+                rt.missed = 0;
+            }
+            self.emit(Event::Note { text: noticed.clone() });
+            self.emit_status();
+            self.notify_desktop(&noticed).await;
+            return noticed;
+        }
         let (text, seq, unanswered) = {
             let mut rt = self.rt();
             if rt.awaiting_reply {
@@ -597,8 +613,9 @@ impl App {
         self.notify_desktop(&text).await;
         let after = self.config().settings.remind_after_minutes;
         if after > 0 {
-            tokio::spawn(self.clone().remind(seq, unanswered, text, Duration::from_secs(u64::from(after) * 60)));
+            tokio::spawn(self.clone().remind(seq, unanswered, text.clone(), Duration::from_secs(u64::from(after) * 60)));
         }
+        text
     }
 
     /// Sends check-in `seq` again after `after`, if it's still the latest and unanswered.
@@ -799,8 +816,7 @@ impl App {
                 let result = if self.rt().paused {
                     Err(anyhow::anyhow!("Check-ins are paused; resume first."))
                 } else {
-                    self.checkin().await;
-                    Ok(Event::Ok { text: self.rt().last_checkin.clone().unwrap_or_default() })
+                    Ok(Event::Ok { text: self.checkin().await })
                 };
                 answer(&mut out, result).await
             }

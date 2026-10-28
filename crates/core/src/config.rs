@@ -92,6 +92,8 @@ pub struct Settings {
     /// Run right before each check-in to pick up progress and new work from your sources,
     /// e.g. "check my PRs and Slack for progress on my tasks or new tasks". Empty: off.
     pub progress_check: String,
+    /// When the progress check reports anything, send that instead of the check-in question.
+    pub skip_checkin_on_progress: bool,
     /// Skip a check-in that would fire more than this many minutes late (e.g. after sleep).
     pub late_checkin_minutes: u32,
     /// How much of the conversation each turn sees: recent exchanges and log entries.
@@ -117,6 +119,7 @@ impl Default for Settings {
             report_lookback_days: 7,
             morning_bootstrap: DEFAULT_BOOTSTRAP.into(),
             progress_check: String::new(),
+            skip_checkin_on_progress: false,
             late_checkin_minutes: 5,
             recent_turns: 6,
             recent_log_entries: 10,
@@ -304,7 +307,7 @@ pub struct Me {
     /// Nicknames and handles people use for you.
     pub aliases: Vec<String>,
     pub github: Option<String>,
-    /// Slack handle and/or member id, e.g. "@becker (U012345)".
+    /// Slack handle and/or member id, e.g. "@sam (U012345)".
     pub slack: Option<String>,
     pub email: Option<String>,
     /// Anything else the coach should know about you, in your own words.

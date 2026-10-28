@@ -55,6 +55,12 @@ checkin_popover = 0
 progress_check = ""
 # progress_check = "check my PRs and Slack for progress on my current tasks or new tasks"
 
+# When the progress check reports anything (work done, new work, related messages),
+# send just that, as a note needing no reply, instead of asking what you're on. It
+# also clears a check-in still waiting on you. Only when it finds nothing do you get
+# the usual check-in question.
+skip_checkin_on_progress = false
+
 # The end-of-day report: "end" of work_hours (17:00 when there are none), a time
 # like "17:30", or "off". `focus report` writes one any time.
 report_at = "end"

@@ -761,6 +761,28 @@ async fn the_progress_check_runs_right_before_a_check_in() {
 }
 
 #[tokio::test]
+async fn progress_found_replaces_the_check_in_question_when_asked_to() {
+    let h = start_top(TASKS, "progress_check = \"check my PRs\"\nskip_checkin_on_progress = true\nwork_hours = \"\"").await;
+    // Nothing found: the usual question, now waiting on a reply.
+    h.llm.script([text("")]);
+    let events = h.send(Request::CheckIn).await;
+    assert!(matches!(&events[0], Event::Ok { text } if text.starts_with("What are you on?")), "{events:?}");
+    assert!(h.status().await.awaiting_reply);
+
+    // Something found: just the findings, and the earlier question no longer waits.
+    h.llm.script([
+        calls(&[("check_off", json!({"task_id": "t1"}))]),
+        text("lodash PRs merged, so I checked off t1."),
+    ]);
+    let events = h.send(Request::CheckIn).await;
+    assert!(matches!(&events[0], Event::Ok { text } if text == "lodash PRs merged, so I checked off t1."), "{events:?}");
+    let status = h.status().await;
+    assert!(!status.awaiting_reply && status.missed == 0, "{status:?}");
+    assert_eq!(h.file("log.md").matches("· check-in").count(), 1, "the skipped one isn't logged as a check-in");
+    h.stop().await;
+}
+
+#[tokio::test]
 async fn no_progress_check_when_it_is_blank() {
     let h = start_top(TASKS, "work_hours = \"\"").await;
     let events = h.send(Request::CheckIn).await;

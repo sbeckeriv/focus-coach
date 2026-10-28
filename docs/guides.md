@@ -27,7 +27,7 @@ With `progress_check` set, the coach looks at your sources just before each chec
 lodash PRs merged, so I checked off t1. New review request on api#88: added t9.
 ```
 
-When nothing changed, you get the plain check-in. Leave `progress_check` blank to skip it. It runs once per check-in (every 20 minutes by default), so it uses more of your model plan than check-ins alone. Run `focus checkin` to try it now.
+When nothing changed, you get the plain check-in. With `skip_checkin_on_progress = true`, a check that finds anything sends only what it found, as a note needing no reply, and the question waits for a check-in that finds nothing. Leave `progress_check` blank to skip it. It runs once per check-in (every 20 minutes by default), so it uses more of your model plan than check-ins alone. Run `focus checkin` to try it now.
 
 ## Slack, Notion and other MCP servers (claude-code)
 

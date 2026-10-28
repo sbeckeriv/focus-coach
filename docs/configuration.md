@@ -12,7 +12,7 @@ The settings, by group (the example file has the details):
 |---|---|
 | Check-ins | `schedule`, `work_hours`, `late_checkin_minutes`, `miss_threshold` |
 | Notifications | `notifier`, `remind_after_minutes`, `checkin_popover` |
-| What the coach runs on its own | `morning_bootstrap`, `progress_check`, `report_at` |
+| What the coach runs on its own | `morning_bootstrap`, `progress_check`, `skip_checkin_on_progress`, `report_at` |
 | How much it sees and keeps | `recent_turns`, `recent_log_entries`, `report_lookback_days`, `archive_after_days`, `log_keep_days` |
 | `[llm]` | The provider and models. See [models](models.md). |
 | `[sources]` | `github_org`, `repos_root`, `notion_pages` |
@@ -34,6 +34,7 @@ morning_bootstrap = "Morning: check my open PRs, review requests and PRs merged 
 
 # Before every check-in:
 progress_check = "check my PRs and Slack for progress on my current tasks or new tasks"
+skip_checkin_on_progress = true   # found something? just say what, no question
 
 [llm]
 provider = "claude-code"

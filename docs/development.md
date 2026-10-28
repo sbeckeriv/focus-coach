@@ -8,7 +8,7 @@
 | `crates/focus` | The `focus` CLI and terminal UI |
 | `crates/menubar` | The macOS menubar app (Tauri v2), with a popover chat pane |
 
-One daemon owns the single check-in schedule. Every front end talks to it over `~/.focus/focus.sock`. The CLI starts the daemon on demand. The menubar app hosts the daemon itself when none is running.
+One daemon owns the single check-in schedule. Every front end talks to it over `~/.focus/focus.sock`. The CLI starts the daemon on demand. The menubar app hosts the daemon in-process whenever none answers, at launch or later.
 
 The default `focus.toml` is [docs/focus.example.toml](focus.example.toml), compiled in. A test checks that it mentions every setting and sets only defaults, so a new setting needs a line there.
 
