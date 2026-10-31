@@ -532,9 +532,9 @@ async fn run(app: &Arc<App>, ctx: &mut TurnCtx, call: Call) -> Result<String> {
             Ok("paused until the person's next message".into())
         }
         Call::SnoozeCheckins(SnoozeCheckins { until }) => {
-            let at = crate::hours::parse_until(&until, Local::now())?;
-            let said = app.snooze(at);
-            record(app, ctx, format!("check-ins snoozed until {}", at.format("%a %H:%M")));
+            let said = app.snooze(&until)?;
+            let until = app.rt().snoozed_until.map(|t| t.format("%a %H:%M").to_string()).unwrap_or_default();
+            record(app, ctx, format!("check-ins snoozed until {until}"));
             Ok(said)
         }
         Call::ResumeCheckins(_) => {

@@ -56,7 +56,6 @@ pub enum Request {
 pub struct Status {
     pub paused: bool,
     /// When a snooze ends; a check-in fires then.
-    #[serde(default)]
     pub snoozed_until: Option<DateTime<Local>>,
     pub schedule: String,
     pub next_checkin: Option<DateTime<Local>>,

@@ -2,7 +2,7 @@
 //! Written like "9-17 Mon-Fri", "9:30-17:30 Mon,Tue,Thu" or "8-16" (every day).
 
 use anyhow::{Context, Result, bail};
-use chrono::{DateTime, Datelike, Local, NaiveTime, Weekday};
+use chrono::{DateTime, Datelike, Local, NaiveDate, NaiveTime, Timelike, Weekday};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkHours {
@@ -102,7 +102,13 @@ pub fn parse_until(text: &str, now: DateTime<Local>) -> Result<DateTime<Local>> 
     if time <= now.time() {
         day = day.succ_opt().context("no tomorrow")?;
     }
-    day.and_time(time).and_local_timezone(Local).earliest().context("that time doesn't exist today")
+    local_at(day, time).context("that time doesn't exist today")
+}
+
+/// `time` on `day` here; the first of the two on the hour daylight saving repeats, None
+/// in the hour it skips.
+pub(crate) fn local_at(day: NaiveDate, time: NaiveTime) -> Option<DateTime<Local>> {
+    day.and_time(time).and_local_timezone(Local).earliest()
 }
 
 /// "1h30m", "45m", "2h", "90"; None for anything else.
@@ -133,17 +139,15 @@ fn time_of_day(t: &str) -> Option<NaiveTime> {
         (_, Some(c)) => (c, Some(12)),
         _ => (t, None),
     };
-    let (h, m) = clock.split_once(':').unwrap_or((clock, "0"));
-    let (mut h, m) = (h.parse::<u32>().ok()?, m.parse::<u32>().ok()?);
-    if let Some(offset) = half {
-        if !(1..=12).contains(&h) {
-            return None;
-        }
-        h = h % 12 + offset;
-    } else if !clock.contains(':') {
+    if half.is_none() && !clock.contains(':') {
         return None; // A bare number is minutes, handled above.
     }
-    NaiveTime::from_hms_opt(h, m, 0)
+    let t = time(clock).ok()?;
+    match half {
+        Some(offset) if (1..=12).contains(&t.hour()) => t.with_hour(t.hour() % 12 + offset),
+        Some(_) => None,
+        None => Some(t),
+    }
 }
 
 #[cfg(test)]
@@ -154,7 +158,7 @@ mod tests {
     #[test]
     fn snooze_lengths_and_times() {
         let now = Local.with_ymd_and_hms(2026, 10, 28, 14, 10, 0).unwrap();
-        let at = |text: &str| parse_until(text, now).map(|t| t.format("%a %H:%M").to_string()).map_err(|e| e.to_string());
+        let snooze_at = |text: &str| parse_until(text, now).map(|t| t.format("%a %H:%M").to_string()).map_err(|e| e.to_string());
         for (text, want) in [
             ("45m", "Wed 14:55"),
             ("1h", "Wed 15:10"),
@@ -167,10 +171,10 @@ mod tests {
             ("9:00", "Thu 09:00"),
             ("12am", "Thu 00:00"),
         ] {
-            assert_eq!(at(text).as_deref(), Ok(want), "{text}");
+            assert_eq!(snooze_at(text).as_deref(), Ok(want), "{text}");
         }
         for bad in ["soon", "0", "13pm", "25:00", "1h30"] {
-            assert!(at(bad).is_err(), "{bad} should fail");
+            assert!(snooze_at(bad).is_err(), "{bad} should fail");
         }
     }
 

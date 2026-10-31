@@ -99,6 +99,19 @@ pub(crate) struct Runtime {
     pub recap: VecDeque<(String, String)>,
 }
 
+impl Runtime {
+    /// When the snooze ends, if one is still on at `now`.
+    pub fn snoozed(&self, now: DateTime<Local>) -> Option<DateTime<Local>> {
+        self.snoozed_until.filter(|until| *until > now)
+    }
+
+    /// Nothing is waiting on the person any more.
+    fn clear_pending(&mut self) {
+        self.awaiting_reply = false;
+        self.missed = 0;
+    }
+}
+
 /// The Claude Code session claude-code turns resume.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ClaudeSession {
@@ -225,7 +238,7 @@ impl App {
         let rt = self.rt();
         Status {
             paused: rt.paused,
-            snoozed_until: rt.snoozed_until.filter(|until| *until > Local::now()),
+            snoozed_until: rt.snoozed(Local::now()),
             schedule: self.schedule_of(&rt).to_string(),
             next_checkin: rt.next_checkin,
             awaiting_reply: rt.awaiting_reply,
@@ -314,16 +327,17 @@ impl App {
 
     /// Holds check-ins until `until`, when one fires (or at the next slot inside work
     /// hours). Returns what to tell the person.
-    pub(crate) fn snooze(&self, until: DateTime<Local>) -> String {
+    pub(crate) fn snooze(&self, until: &str) -> Result<String> {
+        let until = crate::hours::parse_until(until, Local::now())?;
         self.rt().snoozed_until = Some(until);
         self.persist();
         self.rearm.send_modify(|g| *g += 1);
         let when = until.format("%a %H:%M");
-        if self.in_work_hours(until) {
+        Ok(if self.in_work_hours(until) {
             format!("Snoozed until {when}. I'll check in then.")
         } else {
             format!("Snoozed until {when}, then the next check-in inside work hours.")
-        }
+        })
     }
 
     fn in_work_hours(&self, at: DateTime<Local>) -> bool {
@@ -336,8 +350,7 @@ impl App {
             let mut rt = self.rt();
             rt.paused = false;
             rt.snoozed_until = None;
-            rt.missed = 0;
-            rt.awaiting_reply = false;
+            rt.clear_pending();
         }
         self.persist();
         self.rearm.send_modify(|g| *g += 1);
@@ -431,7 +444,7 @@ impl App {
         if self.config().settings.work_hours.as_ref().is_some_and(|w| !w.is_work_day(now)) {
             return None;
         }
-        now.date_naive().and_time(time).and_local_timezone(Local).earliest()
+        crate::hours::local_at(now.date_naive(), time)
     }
 
     /// Runs the morning bootstrap if this is the day's first interaction, and returns its
@@ -527,12 +540,11 @@ impl App {
         'outer: loop {
             let cron = self.schedule_of(&self.rt());
             let now = Local::now();
-            let snoozed = self.rt().snoozed_until.filter(|until| *until > now);
+            let snoozed = self.rt().snoozed(now);
             let next = match snoozed {
                 // The snooze's end is a check-in of its own, when work hours allow.
                 Some(until) if self.in_work_hours(until) => Some(until),
-                Some(until) => self.next_fire(&cron, until),
-                None => self.next_fire(&cron, now),
+                _ => self.next_fire(&cron, snoozed.unwrap_or(now)),
             };
             self.rt().next_checkin = next;
             self.emit_status();
@@ -616,11 +628,7 @@ impl App {
             && let Some(noticed) = noticed
         {
             // Activity is as good as an answer: nothing is waiting on the person now.
-            {
-                let mut rt = self.rt();
-                rt.awaiting_reply = false;
-                rt.missed = 0;
-            }
+            self.rt().clear_pending();
             self.emit(Event::Note { text: noticed.clone() });
             self.emit_status();
             self.notify_desktop(&noticed).await;
@@ -657,8 +665,7 @@ impl App {
         tokio::time::sleep(after).await;
         {
             let rt = self.rt();
-            let snoozed = rt.snoozed_until.is_some_and(|until| until > Local::now());
-            if rt.paused || snoozed || !rt.awaiting_reply || rt.checkin_seq != seq {
+            if rt.paused || rt.snoozed(Local::now()).is_some() || !rt.awaiting_reply || rt.checkin_seq != seq {
                 return;
             }
         }
@@ -812,7 +819,7 @@ impl App {
                 answer(&mut out, Ok(Event::Ok { text: "Check-ins paused until your next message.".into() })).await
             }
             Request::Snooze { until } => {
-                let said = crate::hours::parse_until(&until, Local::now()).map(|t| Event::Ok { text: self.snooze(t) });
+                let said = self.snooze(&until).map(|text| Event::Ok { text });
                 answer(&mut out, said).await
             }
             Request::NewSession => answer(&mut out, Ok(Event::Ok { text: self.new_session() })).await,
