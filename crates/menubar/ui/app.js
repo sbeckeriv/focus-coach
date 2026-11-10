@@ -69,6 +69,24 @@ function renderTimes() {
   }
 }
 
+// The popover stays open for days; past `popover_messages` (0 = no limit) the oldest
+// messages are dropped so the feed (and relabeling its times) stays cheap. Reread on
+// focus so a config edit applies without a restart.
+let feedLimit = 200;
+
+async function loadFeedLimit() {
+  try {
+    feedLimit = await invoke("feed_limit");
+    trimFeed();
+  } catch {}
+}
+
+function trimFeed() {
+  if (!feedLimit) return;
+  const msgs = feed.querySelectorAll(".msg:not(.thinking)");
+  for (let i = 0; i < msgs.length - feedLimit; i++) msgs[i].remove();
+}
+
 function push(cls, text) {
   const node = el("div", `msg ${cls}`);
   if (cls !== "thinking") {
@@ -80,6 +98,7 @@ function push(cls, text) {
   }
   node.append(linkify(text));
   feed.appendChild(node);
+  trimFeed();
   renderTimes();
   feed.scrollTop = feed.scrollHeight;
   return node;
@@ -272,6 +291,11 @@ $("composer").addEventListener("submit", (e) => {
   if (!text) return;
   input.value = "";
   input.style.height = "";
+  // Only empties this window; the coach's own memory of the conversation is unchanged.
+  if (text === "/clear") {
+    for (const node of feed.querySelectorAll(".msg:not(.thinking)")) node.remove();
+    return;
+  }
   push("you", text);
   const cmd = slash(text);
   run(cmd ? invoke("control", cmd) : invoke("say", { text }));
@@ -326,9 +350,11 @@ listen("focus-connected", (e) => {
 window.addEventListener("focus", () => {
   input.focus();
   refreshTasks();
+  loadFeedLimit();
 });
 
 invoke("status").then(renderStatus).catch(() => {});
+loadFeedLimit();
 refreshTasks();
 setInterval(refreshTasks, 10000);
 setInterval(renderTimes, 60000);

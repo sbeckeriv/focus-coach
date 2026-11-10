@@ -78,6 +78,9 @@ pub struct Settings {
     /// in a row are waiting on a reply: 1 is every check-in, 0 never. `true`/`false` mean 1/0.
     #[serde(deserialize_with = "popover_after")]
     pub checkin_popover: u32,
+    /// Messages the popover's conversation keeps; older ones are dropped so it stays fast.
+    /// 0 keeps everything.
+    pub popover_messages: usize,
     pub notifier: Notifier,
     /// Days a done item stays on the list before moving to done.md; 0 moves it right away.
     pub archive_after_days: u32,
@@ -112,6 +115,7 @@ impl Default for Settings {
             miss_threshold: 3,
             remind_after_minutes: 5,
             checkin_popover: 0,
+            popover_messages: 200,
             notifier: Notifier::Desktop,
             archive_after_days: 1,
             log_keep_days: 30,

@@ -145,6 +145,12 @@ async fn status(paths: tauri::State<'_, Paths>) -> Result<Status, String> {
     status.ok_or_else(|| "no status in reply".into())
 }
 
+/// `popover_messages`: how many messages the conversation keeps (0 = all).
+#[tauri::command]
+fn feed_limit(paths: tauri::State<'_, Paths>) -> usize {
+    Settings::load(&paths).map_or(Settings::default().popover_messages, |s| s.popover_messages)
+}
+
 fn show_popover(app: &AppHandle, anchor: Option<Rect>) {
     let Some(win) = app.get_webview_window("main") else { return };
     if let Some(rect) = anchor
@@ -427,7 +433,7 @@ fn main() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_autostart::Builder::new().macos_launcher(MacosLauncher::LaunchAgent).build())
         .manage(paths.clone())
-        .invoke_handler(tauri::generate_handler![say, control, tasks, status, open_url])
+        .invoke_handler(tauri::generate_handler![say, control, tasks, status, open_url, feed_limit])
         .setup(move |app| {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);

@@ -42,6 +42,10 @@ remind_after_minutes = 5
 # check-in, 0 never does. (true and false mean 1 and 0.)
 checkin_popover = 0
 
+# Messages the popover's conversation keeps; the oldest are dropped past this so
+# it stays fast when the app runs for days. 0 keeps everything.
+popover_messages = 200
+
 # ── What the coach runs on its own ────────────────────────────────────────────
 
 # Runs before your first message or check-in each day, to build or refresh the

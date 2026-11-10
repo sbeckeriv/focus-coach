@@ -36,7 +36,7 @@ To copy text, press **F2** for select mode: the mouse goes back to your terminal
 
 ## The menubar app
 
-Click the icon for the popover: the task list on top, the conversation below, and the same slash commands as the TUI. The header shows when the next check-in is, and what you're on. Hover a task and press **On it** to mark it active; click its title for its notes and links, and to add a note. The window resizes, and the bar between the tasks and the conversation drags. Messages show the time they were sent, and links open in your browser. The icon's menu can snooze check-ins for 30 minutes or an hour; `z` beside the icon means a snooze is on, and `⏸` a pause. For a quick try without bundling, run `cargo run -p focus-menubar`.
+Click the icon for the popover: the task list on top, the conversation below, and the same slash commands as the TUI. The header shows when the next check-in is, and what you're on. Hover a task and press **On it** to mark it active; click its title for its notes and links, and to add a note. The window resizes, and the bar between the tasks and the conversation drags. Messages show the time they were sent, and links open in your browser. The conversation keeps the last 200 messages (`popover_messages`); `/clear` empties it, which doesn't change what the coach remembers. The icon's menu can snooze check-ins for 30 minutes or an hour; `z` beside the icon means a snooze is on, and `⏸` a pause. For a quick try without bundling, run `cargo run -p focus-menubar`.
 
 The app runs the daemon itself whenever none is running: at launch, and within a couple of seconds if the one it was using stops. So while the app is open, `focus stop` only restarts the daemon; quit the app to stop it.
 
